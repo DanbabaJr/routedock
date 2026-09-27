@@ -4,7 +4,7 @@ import { stellar, close as channelClose, Store } from '@stellar/mpp/channel/serv
 import { Mppx, Request as MppxRequest } from 'mppx/server'
 import { Store as MppxStore } from 'mppx'
 import type { RouteDockManifest } from '../types.js'
-import { resolveVaultSettlementAddresses } from './internal/vaultSettlement.js'
+import { buildSessionSettlementTransaction, resolveVaultSettlementAddresses } from './internal/vaultSettlement.js'
 import { extractPayerAddress } from './payer.js'
 import { channelAuthorizer, withTypedChannelErrors } from './mppCompatibility.js'
 import type { Method } from 'mppx'
@@ -231,10 +231,12 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
           }
 
           // Optionally record session_settled on the agent vault.
-          // Requires AGENT_VAULT_CONTRACT and AGENT_VAULT_ADMIN_SECRET env vars.
+          // The vault authorizes this call with the allowlisted payee's own key,
+          // so the payee is the transaction source and signs it. Requires the
+          // AGENT_VAULT_CONTRACT env var only — the vault admin secret is never
+          // read, so a provider never holds the key that guards upgrade().
           const vaultContract = process.env.AGENT_VAULT_CONTRACT
-          const vaultAdminSecret = process.env.AGENT_VAULT_ADMIN_SECRET
-          if (vaultContract && vaultAdminSecret) {
+          if (vaultContract) {
             const settlementAddresses = resolveVaultSettlementAddresses(
               sessionPayerAddress,
               payeeKeypair.publicKey(),
@@ -243,34 +245,26 @@ export function createMppSessionHandler(opts: MppSessionHandlerOptions): Request
               console.error('[mpp-session] skipped session_settled vault record: payer address unavailable')
             } else {
               try {
-                const { Contract, TransactionBuilder, BASE_FEE, Networks, Account } = await import('@stellar/stellar-sdk')
+                const { Networks } = await import('@stellar/stellar-sdk')
                 const { Server } = await import('@stellar/stellar-sdk/rpc')
-                const adminKp = Keypair.fromSecret(vaultAdminSecret)
                 const networkPassphrase = opts.network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET
                 const rpcUrl = opts.network === 'mainnet'
                   ? 'https://mainnet.sorobanrpc.com'
                   : 'https://soroban-testnet.stellar.org'
                 const server = new Server(rpcUrl)
-                const sourceAccount = await server.getAccount(adminKp.publicKey())
-                const vault = new Contract(vaultContract)
-                const { nativeToScVal, Address: StellarAddress } = await import('@stellar/stellar-sdk')
-                const op = vault.call(
-                  'record_session_settlement',
-                  nativeToScVal(opts.channelFactory, { type: 'address' }),
-                  nativeToScVal(settlementAddresses.payer, { type: 'address' }),
-                  nativeToScVal(settlementAddresses.payee, { type: 'address' }),
-                  nativeToScVal(closeAmount, { type: 'i128' }),
-                  nativeToScVal(voucherCount, { type: 'u32' }),
-                )
-                const tx = new TransactionBuilder(sourceAccount, {
-                  fee: BASE_FEE,
+                const payeePublicKey = payeeKeypair.publicKey()
+                const sourceAccount = await server.getAccount(payeePublicKey)
+                const tx = buildSessionSettlementTransaction(
+                  sourceAccount,
+                  vaultContract,
+                  opts.channelFactory,
+                  settlementAddresses,
+                  closeAmount,
+                  voucherCount,
                   networkPassphrase,
-                })
-                  .addOperation(op)
-                  .setTimeout(30)
-                  .build()
+                )
                 const preparedTx = await server.prepareTransaction(tx)
-                preparedTx.sign(adminKp)
+                preparedTx.sign(payeeKeypair)
                 await server.sendTransaction(preparedTx)
               } catch (recordErr) {
                 console.error('[mpp-session] failed to record session_settled on vault:', recordErr)

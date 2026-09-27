@@ -158,7 +158,11 @@ impl AgentVault {
         );
     }
 
-    /// Record an off-chain channel settlement. Emits `session_settled`. Admin only.
+    /// Record an off-chain channel settlement. Emits `session_settled`.
+    /// Authorized by the allowlisted `payee` itself, not the vault admin: a
+    /// third-party provider records its own settlements with its own payee key
+    /// and never holds the admin secret, which also guards `upgrade` and
+    /// `set_agent_pubkey`.
     pub fn record_session_settlement(
         env: Env,
         channel_id: Address,
@@ -167,11 +171,18 @@ impl AgentVault {
         cumulative_amount: i128,
         voucher_count: u32,
     ) {
-        let storage = env.storage().instance();
-        let admin: Address = storage
-            .get(&ADMIN_KEY)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        admin.require_auth();
+        if cumulative_amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+        let allowlist: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&LIST_KEY)
+            .unwrap_or_else(|| Map::new(&env));
+        if allowlist.get(payee.clone()).is_none() {
+            panic_with_error!(&env, Error::PayeeNotAllowed);
+        }
+        payee.require_auth();
 
         // topics: (Symbol("session_settled"), channel_id, payee)
         // data:   (payer, cumulative_amount, voucher_count)
@@ -1217,24 +1228,154 @@ mod tests {
         assert_eq!(data_tuple.2, voucher_count, "data[2] should be voucher_count");
     }
 
-    /// Test 18: record_session_settlement without admin auth panics
-    #[test]
-    #[should_panic]
-    fn test_session_settled_requires_admin_auth() {
-        let env = Env::default();
+    /// Build a vault whose allowlist contains a single payee, returning the
+    /// client, the vault id, the admin address and the allowlisted payee.
+    fn setup_settlement(env: &Env) -> (AgentVaultClient<'_>, Address, Address, Address) {
         let vault_id = env.register(AgentVault, ());
-        let client = AgentVaultClient::new(&env, &vault_id);
+        let client = AgentVaultClient::new(env, &vault_id);
 
-        let admin = Address::generate(&env);
-        let (_, agent_pk) = gen_keypair(&env);
-        let provider_a = Address::generate(&env);
-        let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        let admin = Address::generate(env);
+        let (_, agent_pk) = gen_keypair(env);
+        let provider_a = Address::generate(env);
+        let allowlist = Map::from_array(env, [(provider_a.clone(), 5_000_000_i128)]);
         client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
 
-        // No mock_all_auths() — require_auth() must panic
-        let channel = Address::generate(&env);
+        (client, vault_id, admin, provider_a)
+    }
+
+    /// Test 18a: an allowlisted payee authorizes its own settlement record —
+    /// no admin auth entry is mocked at all.
+    #[test]
+    fn test_session_settled_authorized_by_allowlisted_payee() {
+        use soroban_sdk::{testutils::Events, IntoVal};
+
+        let env = Env::default();
+        let (client, vault_id, _admin, payee) = setup_settlement(&env);
+
+        let channel_id = Address::generate(&env);
         let payer = Address::generate(&env);
-        client.record_session_settlement(&channel, &payer, &provider_a, &500_000_i128, &10_u32);
+        let cumulative_amount: i128 = 500_000;
+        let voucher_count: u32 = 7;
+
+        // Only the payee authorizes. The admin is deliberately absent, so this
+        // fails if record_session_settlement still requires admin auth.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &payee,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "record_session_settlement",
+                args: (
+                    channel_id.clone(),
+                    payer.clone(),
+                    payee.clone(),
+                    cumulative_amount,
+                    voucher_count,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.record_session_settlement(
+            &channel_id,
+            &payer,
+            &payee,
+            &cumulative_amount,
+            &voucher_count,
+        );
+
+        let events = env.events().all();
+        let evt_name = Symbol::new(&env, "session_settled");
+        let matching: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(addr, topics, _)| {
+                *addr == vault_id
+                    && topics
+                        .get(0)
+                        .map_or(false, |t| Symbol::from_val(&env, &t) == evt_name)
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one session_settled event expected");
+
+        let (_, topics, data) = &matching[0];
+        let topic_channel: Address = topics.get(1).unwrap().into_val(&env);
+        let topic_payee: Address = topics.get(2).unwrap().into_val(&env);
+        assert_eq!(topic_channel, channel_id, "topic[1] should be channel_id");
+        assert_eq!(topic_payee, payee, "topic[2] should be payee");
+
+        let data_tuple: (Address, i128, u32) = data.clone().into_val(&env);
+        assert_eq!(data_tuple.0, payer, "data[0] should be payer");
+        assert_eq!(data_tuple.1, cumulative_amount, "data[1] should be cumulative_amount");
+        assert_eq!(data_tuple.2, voucher_count, "data[2] should be voucher_count");
+    }
+
+    /// Test 18b: the admin alone can no longer record a settlement.
+    #[test]
+    #[should_panic]
+    fn test_session_settled_rejects_admin_only_auth() {
+        let env = Env::default();
+        let (client, vault_id, admin, payee) = setup_settlement(&env);
+
+        let channel_id = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        // Authorized by the admin, but not by the allowlisted payee.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "record_session_settlement",
+                args: (channel_id.clone(), payer.clone(), payee.clone(), 500_000_i128, 10_u32)
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.record_session_settlement(&channel_id, &payer, &payee, &500_000_i128, &10_u32);
+    }
+
+    /// Test 18c: a payee that is not on the allowlist is rejected even when it
+    /// authorizes itself and every other auth is mocked.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_session_settled_rejects_non_allowlisted_payee() {
+        let env = Env::default();
+        let (client, _vault_id, _admin, _payee) = setup_settlement(&env);
+
+        let stranger = Address::generate(&env);
+        let channel_id = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        // mock_all_auths would satisfy require_auth for anyone — the allowlist
+        // check must be what stops this call.
+        env.mock_all_auths();
+        client.record_session_settlement(&channel_id, &payer, &stranger, &500_000_i128, &10_u32);
+    }
+
+    /// Test 18d: a zero cumulative amount is rejected.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn test_session_settled_rejects_zero_amount() {
+        let env = Env::default();
+        let (client, _vault_id, _admin, payee) = setup_settlement(&env);
+
+        let channel_id = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.record_session_settlement(&channel_id, &payer, &payee, &0_i128, &10_u32);
+    }
+
+    /// Test 18e: a negative cumulative amount is rejected.
+    #[test]
+    #[should_panic(expected = "Error(Contract, #10)")]
+    fn test_session_settled_rejects_negative_amount() {
+        let env = Env::default();
+        let (client, _vault_id, _admin, payee) = setup_settlement(&env);
+
+        let channel_id = Address::generate(&env);
+        let payer = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.record_session_settlement(&channel_id, &payer, &payee, &-1_i128, &10_u32);
     }
 
     /// Test 19: payment within global cap but exceeding per-payee sub-cap is rejected
