@@ -1,7 +1,7 @@
 import { Keypair } from '@stellar/stellar-sdk'
 import { stellar } from '@stellar/mpp/charge/client'
 import { Mppx } from 'mppx/client'
-import type { RouteDockManifest, PaymentResult } from '../types.js'
+import type { RouteDockManifest, PaymentResult, PaymentRequest } from '../types.js'
 import {
   RouteDockManifestError,
   RouteDockPolicyRejectError,
@@ -12,6 +12,7 @@ import {
 import { stroopsToUsdc } from '../internal/usdc.js'
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
 import { checkChargeChallenge, type Caip2Network } from './challenge.js'
+import { prepareRequest, toRequestInit } from '../internal/request.js'
 
 export class MppChargeClient {
   constructor(
@@ -20,7 +21,11 @@ export class MppChargeClient {
     private readonly retryPolicy?: RetryPolicy,
   ) {}
 
-  async pay(url: string, manifest: RouteDockManifest): Promise<PaymentResult> {
+  async pay(
+    url: string,
+    manifest: RouteDockManifest,
+    request?: PaymentRequest,
+  ): Promise<PaymentResult> {
     const pricing = manifest.pricing['mpp-charge']
     if (!pricing) {
       throw new RouteDockManifestError('manifest.pricing.mpp-charge missing')
@@ -28,6 +33,10 @@ export class MppChargeClient {
 
     const caip2: Caip2Network =
       this.network === 'mainnet' ? 'stellar:pubnet' : 'stellar:testnet'
+
+    // Buffered once outside withRetry so the 402 probe, the paid retry inside
+    // mppx and any RouteDock-level retry all send the same body.
+    const prepared = await prepareRequest(request)
 
     let txHash: string | null = null
     let signedAmount: string | undefined
@@ -68,9 +77,11 @@ export class MppChargeClient {
     return withRetry(async (): Promise<PaymentResult> => {
       let response: Response
       try {
+        // The paid retry inside mppx must send the same method and body, and
+        // the credential replaces any caller Authorization header.
         response = credential
-          ? await mppx.rawFetch(url, { headers: { Authorization: credential } })
-          : await mppx.fetch(url)
+          ? await mppx.rawFetch(url, toRequestInit(prepared, { Authorization: credential }))
+          : await mppx.fetch(url, toRequestInit(prepared))
       } catch (err) {
         throw wrapMppError(err, 'MPP charge request')
       }

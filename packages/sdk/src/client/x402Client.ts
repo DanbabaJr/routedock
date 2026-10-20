@@ -5,7 +5,7 @@ import {
   decodePaymentRequiredHeader,
   decodePaymentResponseHeader,
 } from '@x402/core/http'
-import type { RouteDockManifest, PaymentResult } from '../types.js'
+import type { RouteDockManifest, PaymentResult, PaymentRequest } from '../types.js'
 import {
   RouteDockManifestError,
   RouteDockPolicyRejectError,
@@ -17,6 +17,7 @@ import {
 import { stroopsToUsdc } from '../internal/usdc.js'
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
 import { checkX402Accept, filterX402Accepts, type Caip2Network } from './challenge.js'
+import { prepareRequest, toRequestInit } from '../internal/request.js'
 import type { PaymentRequirements } from '@x402/core/types'
 
 type Network = 'testnet' | 'mainnet'
@@ -80,7 +81,11 @@ export class X402Client {
     return new X402Client(signer, this.network, this.retryPolicy, this.preSignHook)
   }
 
-  async pay(url: string, manifest: RouteDockManifest): Promise<PaymentResult> {
+  async pay(
+    url: string,
+    manifest: RouteDockManifest,
+    request?: PaymentRequest,
+  ): Promise<PaymentResult> {
     const pricing = manifest.pricing.x402
     if (!pricing) {
       throw new RouteDockManifestError('manifest.pricing.x402 missing')
@@ -91,11 +96,15 @@ export class X402Client {
 
     const caip2 = CAIP2[this.network]
 
+    // Buffer the caller request once, outside withRetry: the probe, the paid
+    // request and any retry must all send the same method/headers/body.
+    const prepared = await prepareRequest(request)
+
     // Phase 1: unpaid probe. This can retry freely — no payment exists yet.
     const probe = await withRetry(async (): Promise<ProbeOutcome> => {
       let init: Response
       try {
-        init = await fetch(url, { headers: { 'X-Preferred-Mode': 'x402' } })
+        init = await fetch(url, toRequestInit(prepared, { 'X-Preferred-Mode': 'x402' }))
       } catch (err) {
         throw wrapFetchError(err, 'x402 initial request')
       }
@@ -191,7 +200,8 @@ export class X402Client {
     const settled = await withRetry(async (): Promise<Response> => {
       let response: Response
       try {
-        response = await fetch(url, { headers: paymentHeaders })
+        // Payment headers are layered last, so a caller cannot shadow them.
+        response = await fetch(url, toRequestInit(prepared, paymentHeaders))
       } catch (err) {
         throw wrapFetchError(err, 'x402 settlement request')
       }

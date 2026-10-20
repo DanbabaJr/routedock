@@ -67,6 +67,21 @@ function jsonResponse(body: unknown, status = 200): Response {
   })
 }
 
+/**
+ * Replace the real x402 signing client with a stub that returns a fixed payment
+ * header: these tests only exercise HTTP request propagation, not signing.
+ */
+function stubSigning(client: X402Client): void {
+  ;(client as unknown as { httpClient: unknown }).httpClient = {
+    createPaymentPayload: async () => ({
+      x402Version: 2,
+      accepted: baseRequirements,
+      payload: { signature: 'fake' },
+    }),
+    encodePaymentSignatureHeader: () => ({ 'PAYMENT-SIGNATURE': 'sdk-payment' }),
+  }
+}
+
 function makePayload(accepted: PaymentRequirements = baseRequirements): PaymentPayload {
   return { x402Version: 2, accepted, payload: {} }
 }
@@ -117,6 +132,136 @@ test('X402Client - free 200 response returns amount: "0"', async () => {
     assert.equal(result.txHash, null)
     assert.equal(result.mode, 'x402')
     assert.deepEqual(result.data, { status: 'ok', free: true })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('X402Client - POST method and body are replayed on the probe and the paid request', async () => {
+  const client = new X402Client(keypair.secret(), 'testnet')
+  stubSigning(client)
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ url: string; init: RequestInit }> = []
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(input), init: init ?? {} })
+    return calls.length === 1 ? paymentRequiredResponse() : jsonResponse({ prediction: 42 })
+  }) as typeof fetch
+
+  const body = JSON.stringify({ prompt: 'hello' })
+  try {
+    const result = await client.pay('https://api.test/infer', manifest, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-trace-id': 'trace-1' },
+      body,
+    })
+
+    assert.deepEqual(result.data, { prediction: 42 })
+    assert.equal(calls.length, 2, 'expected one probe and one paid request')
+
+    for (const [index, call] of calls.entries()) {
+      assert.equal(call.url, 'https://api.test/infer')
+      assert.equal(call.init.method, 'POST', `attempt ${index + 1} must use POST`)
+      assert.equal(
+        new Headers(call.init.headers).get('content-type'),
+        'application/json',
+        `attempt ${index + 1} must keep caller headers`,
+      )
+      assert.equal(
+        new Headers(call.init.headers).get('x-trace-id'),
+        'trace-1',
+        `attempt ${index + 1} must keep caller headers`,
+      )
+      assert.equal(
+        await new Response(call.init.body).text(),
+        body,
+        `attempt ${index + 1} must send the same body`,
+      )
+    }
+
+    assert.equal(
+      new Headers(calls[0]!.init.headers).get('x-preferred-mode'),
+      'x402',
+      'probe must carry the SDK mode hint',
+    )
+    assert.equal(
+      new Headers(calls[1]!.init.headers).get('payment-signature'),
+      'sdk-payment',
+      'paid request must carry the SDK payment header',
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('X402Client - caller headers cannot override SDK payment or mode headers', async () => {
+  const client = new X402Client(keypair.secret(), 'testnet')
+  stubSigning(client)
+  const originalFetch = globalThis.fetch
+  const calls: RequestInit[] = []
+
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push(init ?? {})
+    return calls.length === 1 ? paymentRequiredResponse() : jsonResponse({ ok: true })
+  }) as typeof fetch
+
+  try {
+    await client.pay('https://api.test/infer', manifest, {
+      method: 'POST',
+      headers: {
+        'X-Preferred-Mode': 'mpp-charge',
+        'PAYMENT-SIGNATURE': 'caller-forged',
+      },
+      body: '{}',
+    })
+
+    assert.equal(new Headers(calls[0]!.headers).get('x-preferred-mode'), 'x402')
+    assert.equal(new Headers(calls[1]!.headers).get('payment-signature'), 'sdk-payment')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('X402Client - retries resend the same buffered body', async () => {
+  const client = new X402Client(keypair.secret(), 'testnet', {
+    maxAttempts: 2,
+    baseDelayMs: 1,
+    maxDelayMs: 2,
+  })
+  stubSigning(client)
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ method?: string; body: string }> = []
+
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    // Drain the body before failing, mimicking a transport that consumed it.
+    const body = await new Response(init?.body).text()
+    calls.push({ ...(init?.method ? { method: init.method } : {}), body })
+    if (calls.length === 1) throw new TypeError('fetch failed')
+    return calls.length === 2 ? paymentRequiredResponse() : jsonResponse({ ok: true })
+  }) as typeof fetch
+
+  const body = JSON.stringify({ prompt: 'retry me' })
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(body))
+      controller.close()
+    },
+  })
+
+  try {
+    const result = await client.pay('https://api.test/infer', manifest, {
+      method: 'POST',
+      body: stream,
+    })
+
+    assert.deepEqual(result.data, { ok: true })
+    assert.equal(calls.length, 3, 'expected a failed attempt, a probe and a paid request')
+    assert.deepEqual(
+      calls.slice(1).map((call) => call.body),
+      [body, body],
+      'the probe and retry must send the same bytes as the first attempt',
+    )
+    assert.ok(calls.every((call) => call.method === 'POST'))
   } finally {
     globalThis.fetch = originalFetch
   }

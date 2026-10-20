@@ -48,6 +48,38 @@ The cap is a single USDC total. If the asset selected for a payment is not
 USDC total. USDC-only providers are unaffected. See
 `docs/MULTI_ASSET_SUPPORT.md`.
 
+### POST endpoints and custom headers
+
+`pay()` sends a `GET` with no body by default. For endpoints that take input,
+pass `request` with the method, headers and body to send:
+
+```ts
+const result = await client.pay('https://provider.example.com/infer', {
+  request: {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-trace-id': 'trace-123' },
+    body: JSON.stringify({ prompt: 'Explain MPP charge in one sentence' }),
+  },
+})
+```
+
+The same request is replayed on the unpaid 402 probe, the paid request and any
+retry, so the body is buffered once (streams are drained up front). Payment
+headers set by the SDK — `PAYMENT-SIGNATURE`/`X-PAYMENT` for x402 and
+`Authorization` for MPP — always win over a caller header with the same name.
+The method also scopes the per-endpoint sunset check, so a sunset `GET /infer`
+no longer blocks an active `POST /infer`.
+
+Sessions accept the same field per stream:
+
+```ts
+for await (const update of session.stream({
+  request: { method: 'POST', body: JSON.stringify({ channel: 'XLM/USDC' }) },
+})) {
+  console.log(update)
+}
+```
+
 ### Durable spend cap
 
 The `spendCap` is enforced via a pluggable `SpendStore` (`read()` / `write()`).
