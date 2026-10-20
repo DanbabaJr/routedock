@@ -258,7 +258,7 @@ export class RouteDockClient {
   ): Promise<{ manifest: RouteDockManifest; mode: PaymentMode }> {
     const baseUrl = new URL(url).origin
     const manifest = await fetchManifest(baseUrl, this.retryPolicy, this.manifestTimeoutMs, this.expectedPayee)
-    assertEndpointActive(manifest, url, this.logger)
+    assertEndpointActive(manifest, url, this.logger, options?.request?.method)
     const mode = selectMode(manifest, options)
     return { manifest, mode }
   }
@@ -426,7 +426,8 @@ export class RouteDockClient {
   async pay(url: string, options?: ModeSelectOptions): Promise<PaymentResult> {
     const baseUrl = new URL(url).origin
     const manifest = await fetchManifest(baseUrl, this.retryPolicy, this.manifestTimeoutMs, this.expectedPayee)
-    assertEndpointActive(manifest, url, this.logger)
+    const request = options?.request
+    assertEndpointActive(manifest, url, this.logger, request?.method)
     const mode = selectMode(manifest, { ...options, ...(this.logger && { logger: this.logger }) })
 
     const selectedAsset = selectAsset(manifest, mode, url).asset
@@ -461,14 +462,14 @@ export class RouteDockClient {
       if (this.vault?.mode === 'nulth') {
         // Mode/prover validation errors thrown here must also release the
         // reservation, which is why the call sits inside this try block.
-        result = await this._payWithNulthVault(url, manifest, mode)
+        result = await this._payWithNulthVault(url, manifest, mode, request)
       } else {
         switch (mode) {
           case 'x402':
-            result = await this.x402.pay(url, manifest)
+            result = await this.x402.pay(url, manifest, request)
             break
           case 'mpp-charge':
-            result = await this.charge.pay(url, manifest)
+            result = await this.charge.pay(url, manifest, request)
             break
           default:
             throw new RouteDockManifestError(`Unknown payment mode: ${mode as string}`)
@@ -499,6 +500,7 @@ export class RouteDockClient {
     url: string,
     manifest: import('../types.js').RouteDockManifest,
     mode: import('../types.js').PaymentMode,
+    request?: import('../types.js').PaymentRequest,
   ): Promise<PaymentResult> {
     const prover = this.vault?.prover ?? 'mock';
     if (this.network === 'mainnet' && prover === 'mock') {
@@ -513,7 +515,7 @@ export class RouteDockClient {
     try {
       const { signer } = await prepareNulthSigner(this.vault!, manifest, mode, this.network)
       const x402 = this.x402.withSigner(signer)
-      const result = await x402.pay(url, manifest)
+      const result = await x402.pay(url, manifest, request)
       return result
     } catch (err) {
       if (err instanceof NulthPolicyError) {
