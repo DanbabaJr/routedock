@@ -15,10 +15,31 @@ jobs:
         # Pinned: Rust 1.97 rejects a transmute in the transitive ethnum crate
         # (E0512). 1.94.x compiles the soroban-sdk deps cleanly.
         uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9 # branch 1.94.1
+      - name: Clear committed contract snapshots
+        # A committed snapshot that no test regenerates is otherwise left alone
+        # and never shows up in the drift check below. Deleting the directory
+        # first makes every committed file either rewritten by a test or
+        # reported as deleted.
+        run: rm -rf contracts/agent-vault/test_snapshots
       - name: Run contract tests
         run: cargo test --manifest-path contracts/agent-vault/Cargo.toml
       - name: Run contract proptest invariants
         run: cargo test --manifest-path contracts/agent-vault/Cargo.toml --features testutils
+      - name: Check contract snapshots are up to date (#551)
+        # Snapshot files record the agent public key and full env state, so they
+        # must match the committed files exactly: a diff here means contract
+        # behavior changed without regenerating snapshots, a test ran without
+        # committing its snapshot, or a committed snapshot is stale.
+        run: |
+          drift=$(git status --porcelain -- contracts/agent-vault/test_snapshots)
+          if [ -n "$drift" ]; then
+            echo '::error::contracts/agent-vault/test_snapshots drifted from the committed files.'
+            echo 'Run: cargo test --manifest-path contracts/agent-vault/Cargo.toml'
+            echo 'then `git add contracts/agent-vault/test_snapshots` and commit it in this PR.'
+            echo "$drift"
+            git --no-pager diff --stat -- contracts/agent-vault/test_snapshots
+            exit 1
+          fi
 
   contract-wasm:
     runs-on: ubuntu-latest

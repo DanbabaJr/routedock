@@ -664,12 +664,58 @@ mod tests {
     // Use ed25519-dalek for signing in tests (same pattern as Crossmint/stellar-smart-account)
     extern crate std;
     use ed25519_dalek::{Signer as _, SigningKey};
-    use rand::rngs::OsRng;
+    use rand::{rngs::StdRng, SeedableRng};
+    use std::cell::Cell;
+
+    /// Per-test-thread counter for key seeds. Snapshot files record the agent
+    /// public key, so a fresh `OsRng` key on every run rewrote every committed
+    /// `test_snapshots/tests/*.json` (#551).
+    ///
+    /// Seeding must not depend on the order tests happen to run in: the harness
+    /// executes them on parallel threads, so a process-wide counter hands a
+    /// different ordinal to a given test from run to run and the snapshots drift
+    /// again. The seed combines the test thread's name (the harness names it after
+    /// the test) with a thread-local ordinal, which keeps keys distinct within a
+    /// test and identical across runs.
+    std::thread_local! {
+        static KEY_SEED_COUNTER: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Build the next deterministic seed for the current test.
+    fn next_key_seed() -> u64 {
+        let ordinal = KEY_SEED_COUNTER.with(|counter| {
+            let next = counter.get().wrapping_add(1);
+            counter.set(next);
+            next
+        });
+
+        // FNV-1a over the current test's name.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        if let Some(name) = std::thread::current().name() {
+            for byte in name.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+
+        hash ^ ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
 
     fn gen_keypair(env: &Env) -> (SigningKey, BytesN<32>) {
-        let sk = SigningKey::generate(&mut OsRng);
+        let mut rng = StdRng::seed_from_u64(next_key_seed());
+        let sk = SigningKey::generate(&mut rng);
         let pk = BytesN::<32>::from_array(env, &sk.verifying_key().to_bytes());
         (sk, pk)
+    }
+
+    /// A fixed 32-byte value for tests that need a hash-like argument.
+    ///
+    /// `BytesN::random` draws from the env RNG, whose output differs between runs.
+    /// Any random value that ends up in recorded auth args (a Wasm hash passed to
+    /// `propose_upgrade`, for example) therefore makes the committed snapshot
+    /// drift — the same failure mode #551 fixed for the agent key.
+    fn fixed_hash(env: &Env, tag: u8) -> BytesN<32> {
+        BytesN::from_array(env, &[tag; 32])
     }
 
     fn sign_payload(env: &Env, sk: &SigningKey, payload: &BytesN<32>) -> BytesN<64> {
@@ -2301,7 +2347,7 @@ mod tests {
         assert_eq!(client.pending_upgrade(), None);
         assert_eq!(client.upgrade_timelock_ledgers(), UPGRADE_TIMELOCK_LEDGERS);
 
-        let new_wasm_hash = BytesN::<32>::random(&env);
+        let new_wasm_hash = fixed_hash(&env, 1);
         client.propose_upgrade(&new_wasm_hash);
 
         let ready_at_ledger = 1_000 + UPGRADE_TIMELOCK_LEDGERS;
@@ -2328,11 +2374,11 @@ mod tests {
         env.mock_all_auths();
         env.ledger().set_sequence_number(1_000);
 
-        let old_hash = BytesN::<32>::random(&env);
+        let old_hash = fixed_hash(&env, 1);
         client.propose_upgrade(&old_hash);
         env.ledger().set_sequence_number(2_000);
 
-        let new_hash = BytesN::<32>::random(&env);
+        let new_hash = fixed_hash(&env, 2);
         client.propose_upgrade(&new_hash);
 
         assert_eq!(
@@ -2348,7 +2394,7 @@ mod tests {
         let (client, _agent_sk, vault_id, _provider_a) = setup(&env);
         env.mock_all_auths();
         env.ledger().set_sequence_number(1_000);
-        let new_wasm_hash = BytesN::<32>::random(&env);
+        let new_wasm_hash = fixed_hash(&env, 1);
         client.propose_upgrade(&new_wasm_hash);
 
         let ready_at_ledger = 1_000 + UPGRADE_TIMELOCK_LEDGERS;
@@ -2426,7 +2472,7 @@ mod tests {
         let (client, _agent_sk, vault_id, _provider_a) = setup(&env);
         env.mock_all_auths();
         env.ledger().set_sequence_number(1_000);
-        let missing_hash = BytesN::<32>::random(&env);
+        let missing_hash = fixed_hash(&env, 0xee);
         client.propose_upgrade(&missing_hash);
 
         env.ledger()
@@ -2463,7 +2509,7 @@ mod tests {
         let (client, _agent_sk, _vault_id, _provider_a) = setup(&env);
         env.mock_all_auths();
         env.ledger().set_sequence_number(1_000);
-        let new_wasm_hash = BytesN::<32>::random(&env);
+        let new_wasm_hash = fixed_hash(&env, 1);
         let ready_at_ledger = 1_000 + UPGRADE_TIMELOCK_LEDGERS;
         client.propose_upgrade(&new_wasm_hash);
 
@@ -2519,7 +2565,7 @@ mod tests {
         let client = AgentVaultClient::new(&env, &vault_id);
 
         let non_admin = Address::generate(&env);
-        let new_wasm_hash = BytesN::<32>::random(&env);
+        let new_wasm_hash = fixed_hash(&env, 1);
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
             address: &non_admin,
             invoke: &soroban_sdk::testutils::MockAuthInvoke {
@@ -2552,7 +2598,7 @@ mod tests {
         );
         let client = AgentVaultClient::new(&env, &vault_id);
         env.mock_all_auths();
-        client.propose_upgrade(&BytesN::<32>::random(&env));
+        client.propose_upgrade(&fixed_hash(&env, 1));
         env.ledger().set_sequence_number(UPGRADE_TIMELOCK_LEDGERS);
 
         let non_admin = Address::generate(&env);
@@ -2588,7 +2634,7 @@ mod tests {
         );
         let client = AgentVaultClient::new(&env, &vault_id);
         env.mock_all_auths();
-        client.propose_upgrade(&BytesN::<32>::random(&env));
+        client.propose_upgrade(&fixed_hash(&env, 1));
 
         let non_admin = Address::generate(&env);
         env.mock_auths(&[soroban_sdk::testutils::MockAuth {
@@ -3372,7 +3418,7 @@ mod tests {
             client.set_expiry(&2_000_000_u32)
         });
         assert_refreshes_instance_ttl(&env, &vault_id, "set_agent_pubkey", || {
-            client.set_agent_pubkey(&BytesN::<32>::random(&env))
+            client.set_agent_pubkey(&fixed_hash(&env, 0x7a))
         });
         assert_refreshes_instance_ttl(&env, &vault_id, "transfer_admin", || {
             client.transfer_admin(&new_admin)
@@ -3383,7 +3429,7 @@ mod tests {
         assert_refreshes_instance_ttl(&env, &vault_id, "freeze", || client.freeze());
         assert_refreshes_instance_ttl(&env, &vault_id, "unfreeze", || client.unfreeze());
         assert_refreshes_instance_ttl(&env, &vault_id, "propose_upgrade", || {
-            client.propose_upgrade(&BytesN::<32>::random(&env))
+            client.propose_upgrade(&fixed_hash(&env, 1))
         });
         assert_refreshes_instance_ttl(&env, &vault_id, "cancel_upgrade", || {
             client.cancel_upgrade()
