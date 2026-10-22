@@ -1,13 +1,14 @@
 import { Keypair } from '@stellar/stellar-sdk'
 import { stellar } from '@stellar/mpp/charge/client'
 import { Mppx } from 'mppx/client'
-import type { RouteDockManifest, PaymentResult } from '../types.js'
+import type { RouteDockManifest, PaymentResult, PaymentRequestInit } from '../types.js'
 import {
   RouteDockManifestError,
   httpStatusToError,
   wrapFetchError,
 } from '../errors.js'
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
+import { prepareRequest, toRequestInit } from '../internal/request.js'
 
 export class MppChargeClient {
   constructor(
@@ -16,11 +17,17 @@ export class MppChargeClient {
     private readonly retryPolicy?: RetryPolicy,
   ) {}
 
-  async pay(url: string, manifest: RouteDockManifest): Promise<PaymentResult> {
+  async pay(url: string, manifest: RouteDockManifest, request?: PaymentRequestInit): Promise<PaymentResult> {
     const pricing = manifest.pricing['mpp-charge']
     if (!pricing) {
       throw new RouteDockManifestError('manifest.pricing.mpp-charge missing')
     }
+
+    // Buffer the body once so the re-issued voucher request on every retry
+    // resends the same payload (a ReadableStream body is readable only once).
+    // mppx adds its own Authorization/scheme headers on top of these — caller
+    // headers never override what the payment layer signs.
+    const prepared = await prepareRequest(request)
 
     return withRetry(async () => {
       let txHash: string | null = null
@@ -42,7 +49,7 @@ export class MppChargeClient {
 
       let response: Response
       try {
-        response = await mppx.fetch(url)
+        response = await mppx.fetch(url, toRequestInit(prepared))
       } catch (err) {
         throw wrapFetchError(err, 'MPP charge request')
       }

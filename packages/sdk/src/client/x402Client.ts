@@ -6,7 +6,7 @@ import {
   decodePaymentResponseHeader,
 } from '@x402/core/http'
 import type { Network as X402Network } from '@x402/core/types'
-import type { RouteDockManifest, PaymentResult } from '../types.js'
+import type { RouteDockManifest, PaymentResult, PaymentRequestInit } from '../types.js'
 import {
   RouteDockManifestError,
   RouteDockSignatureError,
@@ -14,6 +14,7 @@ import {
   wrapFetchError,
 } from '../errors.js'
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
+import { prepareRequest, toRequestInit } from '../internal/request.js'
 
 type Network = 'testnet' | 'mainnet'
 
@@ -47,7 +48,7 @@ export class X402Client {
     return new X402Client(signer, this.network, this.retryPolicy)
   }
 
-  async pay(url: string, manifest: RouteDockManifest): Promise<PaymentResult> {
+  async pay(url: string, manifest: RouteDockManifest, request?: PaymentRequestInit): Promise<PaymentResult> {
     const pricing = manifest.pricing.x402
     if (!pricing) {
       throw new RouteDockManifestError('manifest.pricing.x402 missing')
@@ -56,11 +57,16 @@ export class X402Client {
       throw new RouteDockManifestError('manifest.pricing.x402.facilitator missing')
     }
 
+    // 560: the probe, the paid request and retries each send the same
+    // method/headers/body. prepareRequest buffers one-shot bodies (ReadableStream,
+    // Request) once so they can be re-read on every attempt.
+    const prepared = await prepareRequest(request)
+
     return withRetry(async () => {
-      // Initial request — expect 402. Include mode hint so middleware routes correctly.
+      // The mode hint is a winner of the merge so a caller can't drop it.
       let init: Response
       try {
-        init = await fetch(url, { headers: { 'X-Preferred-Mode': 'x402' } })
+        init = await fetch(url, toRequestInit(prepared, { 'X-Preferred-Mode': 'x402' }))
       } catch (err) {
         throw wrapFetchError(err, 'x402 initial request')
       }
@@ -102,7 +108,9 @@ export class X402Client {
 
       let settled: Response
       try {
-        settled = await fetch(url, { headers: paymentHeaders })
+        // Caller-supplied headers are applied first; the payment signature
+        // headers are merged on top so they win on name collisions.
+        settled = await fetch(url, toRequestInit(prepared, paymentHeaders))
       } catch (err) {
         throw wrapFetchError(err, 'x402 settlement request')
       }

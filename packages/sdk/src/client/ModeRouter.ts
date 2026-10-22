@@ -1,5 +1,5 @@
 import { Validator, type Schema } from '@cfworker/json-schema'
-import type { RouteDockManifest, PaymentMode } from '../types.js'
+import type { RouteDockManifest, PaymentMode, PaymentRequestInit } from '../types.js'
 import {
   RouteDockError,
   RouteDockManifestError,
@@ -60,20 +60,26 @@ function assertManifestActive(manifest: RouteDockManifest, baseUrl: string): voi
 
 /**
  * Enforce the per-endpoint `deprecated` and `sunset_at` metadata for the URL
- * being paid. `pay()` never learns the HTTP method, so a path shared by more
- * than one descriptor (e.g. GET and POST on `/infer`) is refused only when
- * every matching descriptor has sunset. Paths the manifest does not list keep
- * today's behavior. Query strings and hashes are ignored because only
+ * being paid. When the caller supplies an HTTP method through pay() options
+ * (#560), only descriptors whose `method` matches are considered, so a GET
+ * /infer descriptor sunset does not block paying POST /infer. Without a
+ * method, a path shared by more than one descriptor is refused only when
+ * every matching descriptor has sunset. Paths the manifest does not list
+ * keep today's behavior. Query strings and hashes are ignored because only
  * `URL.pathname` is compared.
  */
 export function assertEndpointActive(
   manifest: RouteDockManifest,
   url: string,
   logger?: RouteDockLogger,
+  method?: string,
 ): void {
   const pathname = new URL(url).pathname
+  const upperMethod = method?.toUpperCase()
   const matches = Object.entries(manifest.endpoints).filter(
-    ([, descriptor]) => descriptor.path === pathname,
+    ([, descriptor]) =>
+      descriptor.path === pathname &&
+      (upperMethod === undefined || descriptor.method?.toUpperCase() === upperMethod),
   )
   if (matches.length === 0) return
 
@@ -236,9 +242,16 @@ function ttlFromHeaders(headers: Headers, now: number): number {
   return CACHE_TTL_MS
 }
 
+// ── Options ──────────────────────────────────────────────────────────────
+
 export type RouteDockLogger = (message: string) => void
 
 export interface ModeSelectOptions {
+  /**
+   * Optional request configuration (method/headers/body) carried onto the
+   * initial probe and the paid request; see {@link PaymentRequestInit}.
+   */
+  request?: PaymentRequestInit
   /** Force mpp-session if the provider supports it */
   sustained?: boolean
   session?: boolean

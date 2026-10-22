@@ -331,13 +331,15 @@ export class RouteDockClient {
   async pay(url: string, options?: ModeSelectOptions): Promise<PaymentResult> {
     const baseUrl = new URL(url).origin
     const manifest = await fetchManifest(baseUrl, this.retryPolicy, this.manifestTimeoutMs, this.expectedPayee)
-    assertEndpointActive(manifest, url, this.logger)
+    // pay() now knows the HTTP method through options.request (#560), so the
+    // per-method sunset check can match descriptors precisely.
+    assertEndpointActive(manifest, url, this.logger, options?.request?.method)
     const mode = selectMode(manifest, { ...options, ...(this.logger && { logger: this.logger }) })
 
     await this._checkTrustline(manifest)
 
     if (this.vault?.mode === 'nulth') {
-      return this._payWithNulthVault(url, manifest, mode)
+      return this._payWithNulthVault(url, manifest, mode, options?.request)
     }
 
     let amount: string
@@ -363,10 +365,10 @@ export class RouteDockClient {
     try {
       switch (mode) {
         case 'x402':
-          result = await this.x402.pay(url, manifest)
+          result = await this.x402.pay(url, manifest, options?.request)
           break
         case 'mpp-charge':
-          result = await this.charge.pay(url, manifest)
+          result = await this.charge.pay(url, manifest, options?.request)
           break
         default:
           throw new RouteDockManifestError(`Unknown payment mode: ${mode as string}`)
@@ -385,6 +387,7 @@ export class RouteDockClient {
     url: string,
     manifest: import('../types.js').RouteDockManifest,
     mode: import('../types.js').PaymentMode,
+    request?: import('../types.js').PaymentRequestInit,
   ): Promise<PaymentResult> {
     const prover = this.vault?.prover ?? 'mock';
     if (this.network === 'mainnet' && prover === 'mock') {
@@ -399,7 +402,7 @@ export class RouteDockClient {
     try {
       const { signer } = await prepareNulthSigner(this.vault!, manifest, mode, this.network)
       const x402 = this.x402.withSigner(signer)
-      const result = await x402.pay(url, manifest)
+      const result = await x402.pay(url, manifest, request)
       return result
     } catch (err) {
       if (err instanceof NulthPolicyError) {

@@ -26,9 +26,25 @@ const result = await client.pay('https://provider.example.com/price')
 // result.txHash — settlement hash (or null for session vouchers)
 // result.mode   — 'x402' | 'mpp-charge' | 'mpp-session'
 
+// POST endpoints (inference, writes, queries) and custom headers: pass the
+// request fields you want carried onto the probe, the paid request and every
+// retry. Payment headers (x402 signature / mpp voucher) are applied on top and
+// win on header-name collisions.
+const result = await client.pay('https://provider.example.com/infer', {
+  request: {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'hi', temperature: 0.7 }),
+  },
+})
+// The body is buffered once, so success-after-retry still resends the same
+// payload. Sunset metadata is enforced per HTTP method.
+
 // Sustained streaming access
 const session = await client.openSession('https://provider.example.com/stream/orderbook')
-for await (const update of session.stream()) {
+for await (const update of session.stream({
+  request: { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cursor: 0 }) },
+})) {
   console.log(update)
   if (done) break
 }

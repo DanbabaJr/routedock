@@ -337,6 +337,19 @@ export interface SessionEventPayloadMap {
 }
 
 /**
+ * Optional request configuration for pay() and SessionHandle.stream() (#560).
+ * Payment headers (the x402 signature or the mpp voucher) are applied on top
+ * of `headers` and win on name collisions. The body is buffered so the unpaid
+ * probe, the paid request and retries all resend it.
+ */
+export interface PaymentRequestInit {
+  /** HTTP method, e.g. "POST". Defaults to the request's natural method. */
+  method?: string
+  headers?: Record<string, string>
+  body?: BodyInit
+}
+
+/**
  * Options for SessionHandle.stream().
  */
 export interface StreamOptions {
@@ -347,6 +360,12 @@ export interface StreamOptions {
    * vouchers; out-of-order sequence numbers will cause payment failures otherwise.
    */
   concurrency?: number
+  /**
+   * Optional request fields for every voucher request — lets a session
+   * stream hit a POST endpoint with a JSON body and caller headers
+   * (e.g. content-type). See {@link PaymentRequestInit}.
+   */
+  request?: PaymentRequestInit
 }
 
 /** Handle for a live MPP session returned by client.openSession() */

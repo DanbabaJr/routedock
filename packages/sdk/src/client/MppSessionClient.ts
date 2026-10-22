@@ -32,6 +32,7 @@ import {
   wrapFetchError,
 } from '../errors.js'
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
+import { prepareRequest, toRequestInit, type PreparedRequest } from '../internal/request.js'
 import { usdcToStroops } from '../internal/usdc.js'
 
 const MIN_REFUND_WAITING_PERIOD = 17_280
@@ -330,7 +331,8 @@ export class MppSessionClient {
       u: string,
       m: WsMppxLike,
       createCredential: GuardedCredentialCreator,
-    ): AsyncIterable<unknown> => this.streamWebSocket(u, m, createCredential)
+      prepared: PreparedRequest,
+    ): AsyncIterable<unknown> => this.streamWebSocket(u, m, createCredential, prepared)
 
     const mppx = Mppx.create({
       polyfill: false,
@@ -424,11 +426,16 @@ export class MppSessionClient {
       },
 
       async *stream(options?: StreamOptions): AsyncIterable<unknown> {
+        // #560: carry caller request fields (method/headers/body) onto every
+        // voucher request — including the WebSocket 402 probe. The body is
+        // buffered once here so each voucher fetch resends the same payload.
+        const prepared = await prepareRequest(options?.request)
+
         if (mode === 'mpp-session-ws') {
           // WebSocket transport: one connection per stream() call, with one
           // voucher negotiated over HTTP before the upgrade. Each connection
           // counts as one voucher issued.
-          for await (const item of streamWs(url, mppx, createGuardedCredential)) {
+          for await (const item of streamWs(url, mppx, createGuardedCredential, prepared)) {
             vouchersIssued++
             yield item
           }
@@ -442,7 +449,7 @@ export class MppSessionClient {
           withRetry(async () => {
             let resp: Response
             try {
-              resp = await mppx.fetch(url)
+            resp = await mppx.fetch(url, toRequestInit(prepared))
             } catch (err) {
               throw wrapFetchError(err, 'Voucher request')
             }
@@ -811,9 +818,11 @@ export class MppSessionClient {
     url: string,
     mppx: WsMppxLike,
     createCredential: GuardedCredentialCreator,
+    prepared: PreparedRequest,
   ): AsyncIterable<unknown> {
     // ── 1 + 2: channel establishment + voucher negotiation over HTTP ────────
-    const request: RequestInit = { method: 'GET' }
+    const request: RequestInit = toRequestInit(prepared)
+    if (request.method === undefined) request.method = 'GET'
     let probe: Response
     try {
       probe = await mppx.rawFetch(url, request)
@@ -870,9 +879,20 @@ export class MppSessionClient {
             waiters.push(resolve)
           })
 
+    const callerWsHeaders: Record<string, string> = {}
+    if (prepared.headers) {
+      new Headers(prepared.headers).forEach((value, name) => {
+        if (name.toLowerCase() !== 'authorization') {
+          callerWsHeaders[name] = value
+        }
+      })
+    }
+
     const socket = this.webSocketFactory(
       wsUrl,
-      { headers: { authorization: credential } },
+      // The signed voucher is the Authorization header — it must not be
+      // overridable by caller headers, so it is set last.
+      { headers: { ...callerWsHeaders, authorization: credential } },
       {
         onOpen: () => {
           queue.push({ type: 'open' })
