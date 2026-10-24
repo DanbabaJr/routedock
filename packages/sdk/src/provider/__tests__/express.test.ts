@@ -8,6 +8,7 @@ import { routedock, type RouteDockMiddlewareOptions } from '../routedockMiddlewa
 import type { RouteDockManifest } from '../../types.js'
 import { InMemorySeenTxStore, paymentIdempotencyKey } from '../SeenTxStore.js'
 import { usdcToStroops } from '../../internal/usdc.js'
+import { manifestForOptions } from './helpers/manifestFixture.js'
 // Generate fresh keypairs — avoids hardcoding secrets while keeping tests self-contained
 const payeeKeypair = Keypair.random()
 const commitKeypair = Keypair.random()
@@ -46,7 +47,16 @@ const BASE_OPTS = {
   network: 'testnet' as const,
   payeeSecretKey: payeeKeypair.secret(),
   commitmentPublicKey: commitKeypair.publicKey(),
-  manifest,
+}
+
+/** routedock() with a manifest generated from the options under test, unless one is given. */
+function rd(opts: Omit<RouteDockMiddlewareOptions, 'manifest'> & { manifest?: RouteDockManifest }) {
+  return routedock({
+    ...opts,
+    manifest:
+      opts.manifest ??
+      manifestForOptions({ ...opts, assetContract: ASSET_CONTRACT, name: 'Express Test Service' }),
+  })
 }
 
 /** Spin up an Express server, return its base URL and a close function. */
@@ -55,7 +65,7 @@ async function makeServer(
 ): Promise<{ url: string; close: () => Promise<void> }> {
   const app = express()
   app.use(
-    routedock({
+    rd({
       ...BASE_OPTS,
       modes: ['x402', 'mpp-charge', 'mpp-session'],
       pricing: {
@@ -64,7 +74,7 @@ async function makeServer(
         'mpp-session': { rate: '0.0001', channelFactory: CHANNEL_CONTRACT },
       },
       ...overrides,
-    } as Parameters<typeof routedock>[0]),
+    } as Parameters<typeof rd>[0]),
   )
   app.get('/price', (_req: Request, res: Response) => {
     res.json({ price: '42' })
@@ -85,7 +95,7 @@ async function makeServer(
 
 describe('routedock (Express) — manifest endpoint', () => {
   it('serves a signed /.well-known/routedock.json', async () => {
-    const { url, close } = await makeServer({ modes: [] as ('x402' | 'mpp-charge' | 'mpp-session')[], pricing: {} })
+    const { url, close } = await makeServer()
     try {
       const res = await fetch(`${url}/.well-known/routedock.json`)
       assert.equal(res.status, 200)
@@ -97,16 +107,25 @@ describe('routedock (Express) — manifest endpoint', () => {
     }
   })
 
-  it('passes through to route handler when no modes are configured', async () => {
-    const { url, close } = await makeServer({ modes: [], pricing: {} })
-    try {
-      const res = await fetch(`${url}/price`)
-      assert.equal(res.status, 200)
-      const body = await res.json() as { price: string }
-      assert.equal(body.price, '42')
-    } finally {
-      await close()
-    }
+  it('refuses to start when no modes are configured but the manifest lists paid modes', async () => {
+    await assert.rejects(
+      makeServer({ modes: [], pricing: {}, manifest }),
+      /modes do not match manifest\.modes/,
+    )
+  })
+
+  it('refuses to start when an option price differs from the manifest price', async () => {
+    await assert.rejects(
+      makeServer({ modes: ['x402'], pricing: { x402: '0.5' }, manifest: { ...manifest, modes: ['x402'] } }),
+      /routedock: .*pricing\.x402 "0\.5" does not match manifest\.pricing\.x402\.amount "0\.001"/,
+    )
+  })
+
+  it('refuses to start when the manifest fails the schema', async () => {
+    await assert.rejects(
+      makeServer({ manifest: { ...manifest, routedock: 'banana' } as unknown as RouteDockManifest }),
+      /routedock: Invalid manifest/,
+    )
   })
 })
 
@@ -344,12 +363,12 @@ describe('routedock (Express) — settlement idempotency', () => {
     const seenStore = new InMemorySeenTxStore({ warn: false })
     const app = express()
     app.use(
-      routedock({
+      rd({
         ...BASE_OPTS,
         modes: ['x402'],
         pricing: { x402: '0.001' },
         seenTxStore: seenStore,
-      } as Parameters<typeof routedock>[0]),
+      } as Parameters<typeof rd>[0]),
     )
     app.get('/price', (_req: Request, res: Response) => {
       handlerRuns++
@@ -411,21 +430,21 @@ describe('routedock (Express) — settlement idempotency', () => {
     const app = express()
     app.use(
       '/cheap',
-      routedock({
+      rd({
         ...BASE_OPTS,
         modes: ['x402'],
         pricing: { x402: '0.001' },
         seenTxStore: seenStore,
-      } as Parameters<typeof routedock>[0]),
+      } as Parameters<typeof rd>[0]),
     )
     app.use(
       '/expensive',
-      routedock({
+      rd({
         ...BASE_OPTS,
         modes: ['x402'],
         pricing: { x402: '5.00' },
         seenTxStore: seenStore,
-      } as Parameters<typeof routedock>[0]),
+      } as Parameters<typeof rd>[0]),
     )
     app.get('/cheap', (_req: Request, res: Response) => {
       runs.cheap++
@@ -467,7 +486,7 @@ describe('routedock (Express) — constructor validation', () => {
   it('throws when mpp-session mode is enabled without commitmentPublicKey', () => {
     assert.throws(
       () =>
-        routedock({
+        rd({
           ...BASE_OPTS,
           commitmentPublicKey: undefined,
           modes: ['mpp-session'],
@@ -537,10 +556,16 @@ describe('routedock (Express) — multiple modes', () => {
 describe('routedock (Express) — per-mode payee override', () => {
   it('resolves per-mode payee override in manifest signature', async () => {
     const overridePayee = Keypair.random()
+    const x402Only = manifestForOptions({
+      payee: payeeKeypair.publicKey(),
+      modes: ['x402'],
+      pricing: { x402: '0.001' },
+      assetContract: ASSET_CONTRACT,
+      name: 'Express Test Service',
+    })
     const manifestWithOverride: RouteDockManifest = {
-      ...manifest,
+      ...x402Only,
       pricing: {
-        ...manifest.pricing,
         x402: {
           amount: '0.001',
           per: 'request',

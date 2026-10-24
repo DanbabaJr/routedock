@@ -25,12 +25,39 @@ export interface DailySpend {
  * heap memory, any crash, OOM kill, or container restart silently resets it to
  * zero and the cap can be bypassed. Inject a persistent implementation
  * (Redis, SQL, Supabase, a file, …) so the counter survives restarts.
+ *
+ * ### Sharing a store between processes
+ * The client serializes its own read → check → write with an in-memory mutex,
+ * but that only protects one `RouteDockClient` instance. If more than one
+ * process (or client) can use the same backing store — the MCP server and the
+ * E2E agent share `~/.routedock/spend.json` by default — a plain `read()` /
+ * `write()` pair is a lost-update race: two writers both read total X, both
+ * pass the cap check, and both write X + amount, so a payment vanishes from the
+ * accumulator and the cap can be exceeded. A store that is shared across
+ * processes MUST implement {@link SpendStore.update}, which the client uses
+ * instead of `read()` + `write()` whenever it is present.
  */
 export interface SpendStore {
   /** Return the persisted accumulator, or null if none has been written yet. */
   read(): Promise<DailySpend | null>
   /** Persist the accumulator. */
   write(state: DailySpend): Promise<void>
+  /**
+   * Atomically read-modify-write the accumulator. Optional, but required for
+   * stores shared across processes (see above).
+   *
+   * Implementations must guarantee that no other writer can change the state
+   * between the read that produces `prev` and the write of `fn`'s result:
+   * `fn` receives the current state (or `null`), and returns the new state to
+   * persist, or `undefined` to leave the state unchanged (no write). If `fn`
+   * throws, nothing is written and the error propagates. `fn` is synchronous
+   * in spirit — keep it fast and free of side effects, because an
+   * implementation backed by optimistic concurrency (compare-and-swap) may
+   * call it more than once. Resolves to the state after the update.
+   */
+  update?(
+    fn: (prev: DailySpend | null) => DailySpend | undefined,
+  ): Promise<DailySpend | null>
 }
 
 // ── In-memory implementation (default) ──────────────────────────────────────────

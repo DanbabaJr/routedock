@@ -1,3 +1,4 @@
+import { assertProviderConfig } from './internal/assertProviderConfig.js'
 import type { FastifyPluginAsync, FastifyRequest, FastifyReply } from 'fastify'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Request, Response, NextFunction, RequestHandler } from 'express'
@@ -205,6 +206,7 @@ function runExpressHandler(
 const MPP_MODES: readonly PaymentMode[] = ['mpp-session', 'mpp-charge']
 
 export function routedockFastify(opts: RouteDockFastifyOptions): FastifyPluginAsync {
+  assertProviderConfig(opts, 'routedockFastify')
   const signedManifest = signManifest(opts.manifest, opts.payeeSecretKey)
   const handlerMap = new Map<PaymentMode, RequestHandler>()
 

@@ -29,6 +29,8 @@ export const NEUTRAL_ENTRIES = [
   'packages/sdk/dist/client.cjs',
   'packages/sdk/dist/react.js',
   'packages/sdk/dist/react.cjs',
+  'packages/sdk/dist/network.js',
+  'packages/sdk/dist/network.cjs',
   'packages/sdk/dist/provider/hono.js',
   'packages/sdk/dist/provider/hono.cjs',
   'packages/nulth-sdk/dist/index.js',

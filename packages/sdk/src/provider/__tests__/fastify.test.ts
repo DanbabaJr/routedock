@@ -11,6 +11,7 @@ import {
   type SeenTxStore,
 } from '../SeenTxStore.js'
 import { usdcToStroops } from '../../internal/usdc.js'
+import { manifestForOptions } from './helpers/manifestFixture.js'
 
 // Generate fresh keypairs — avoids hardcoding secrets while keeping tests self-contained
 const payeeKeypair = Keypair.random()
@@ -50,7 +51,16 @@ const BASE_OPTS = {
   network: 'testnet' as const,
   payeeSecretKey: payeeKeypair.secret(),
   commitmentPublicKey: commitKeypair.publicKey(),
-  manifest,
+}
+
+/** routedockFastify() with a manifest generated from the options under test, unless one is given. */
+function rf(opts: Omit<RouteDockFastifyOptions, 'manifest'> & { manifest?: RouteDockManifest }) {
+  return routedockFastify({
+    ...opts,
+    manifest:
+      opts.manifest ??
+      manifestForOptions({ ...opts, assetContract: ASSET_CONTRACT, name: 'Fastify Test Service' }),
+  })
 }
 
 /** Spin up a Fastify instance, return its base URL and a close function. */
@@ -59,7 +69,7 @@ async function makeServer(
 ): Promise<{ url: string; close: () => Promise<void> }> {
   const fastify = Fastify()
   await fastify.register(
-    routedockFastify({
+    rf({
       ...BASE_OPTS,
       modes: ['x402', 'mpp-charge', 'mpp-session'],
       pricing: {
@@ -84,7 +94,7 @@ async function makeServer(
 
 describe('routedockFastify — manifest endpoint', () => {
   it('serves a signed /.well-known/routedock.json', async () => {
-    const { url, close } = await makeServer({ modes: [] as ('x402' | 'mpp-charge' | 'mpp-session')[], pricing: {} })
+    const { url, close } = await makeServer()
     try {
       const res = await fetch(`${url}/.well-known/routedock.json`)
       assert.equal(res.status, 200)
@@ -96,16 +106,11 @@ describe('routedockFastify — manifest endpoint', () => {
     }
   })
 
-  it('passes through to route handler when no modes are configured', async () => {
-    const { url, close } = await makeServer({ modes: [], pricing: {} })
-    try {
-      const res = await fetch(`${url}/price`)
-      assert.equal(res.status, 200)
-      const body = await res.json() as { price: string }
-      assert.equal(body.price, '42')
-    } finally {
-      await close()
-    }
+  it('refuses to start when no modes are configured but the manifest lists paid modes', async () => {
+    await assert.rejects(
+      makeServer({ modes: [], pricing: {}, manifest }),
+      /modes do not match manifest\.modes/,
+    )
   })
 })
 
@@ -256,7 +261,7 @@ describe('routedockFastify — settlement idempotency', () => {
   ): Promise<{ url: string; runs: () => number; close: () => Promise<void> }> {
     const app = Fastify()
     await app.register(
-      routedockFastify({
+      rf({
         ...BASE_OPTS,
         modes: ['x402'],
         pricing: { x402: '0.001' },
@@ -366,7 +371,7 @@ describe('routedockFastify — settlement idempotency', () => {
     const app = Fastify()
     await app.register(async (scope) => {
       await scope.register(
-        routedockFastify({
+        rf({
           ...BASE_OPTS,
           modes: ['x402'],
           pricing: { x402: '0.001' },
@@ -380,7 +385,7 @@ describe('routedockFastify — settlement idempotency', () => {
     }, { prefix: '/cheap' })
     await app.register(async (scope) => {
       await scope.register(
-        routedockFastify({
+        rf({
           ...BASE_OPTS,
           modes: ['x402'],
           pricing: { x402: '5.00' },
@@ -417,13 +422,29 @@ describe('routedockFastify — constructor validation', () => {
   it('throws when mpp-session mode is enabled without commitmentPublicKey', () => {
     assert.throws(
       () =>
-        routedockFastify({
+        rf({
           ...BASE_OPTS,
           commitmentPublicKey: undefined,
           modes: ['mpp-session'],
           pricing: { 'mpp-session': { rate: '0.0001', channelFactory: CHANNEL_CONTRACT } },
         } as unknown as Parameters<typeof routedockFastify>[0]),
       /requirescommitmentPublicKey|commitmentPublicKey/i,
+    )
+  })
+})
+
+describe('routedockFastify — configuration vs manifest', () => {
+  it('refuses to start when an option price differs from the manifest price', async () => {
+    await assert.rejects(
+      makeServer({ modes: ['x402'], pricing: { x402: '0.5' }, manifest: { ...manifest, modes: ['x402'] } }),
+      /routedockFastify: .*pricing\.x402 "0\.5" does not match manifest\.pricing\.x402\.amount "0\.001"/,
+    )
+  })
+
+  it('refuses to start when the manifest fails the schema', async () => {
+    await assert.rejects(
+      makeServer({ manifest: { ...manifest, routedock: 'banana' } as unknown as RouteDockManifest }),
+      /routedockFastify: Invalid manifest/,
     )
   })
 })

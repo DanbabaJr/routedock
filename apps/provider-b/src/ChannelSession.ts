@@ -11,26 +11,11 @@ import {
   type ReconciliationStats,
 } from '@routedock/routedock/provider/hono'
 import { Store } from '@stellar/mpp/channel/server'
-import {
-  buildManifest,
-  HORIZON_URLS,
-  SESSION_RATE,
-  USDC_ISSUERS,
-  type Network,
-} from './manifest.js'
+import { buildManifest, SESSION_RATE, type Network } from './manifest.js'
+import { fetchXlmUsdcOrderBook } from '@routedock/routedock/network'
 import type { Env } from './env.js'
 import { createSessionWriters } from './sessionWrites.js'
 import { resolveAssetContract } from './config.js'
-
-interface OrderBookLevel {
-  price: string
-  amount: string
-}
-
-interface OrderBookResponse {
-  asks: OrderBookLevel[]
-  bids: OrderBookLevel[]
-}
 
 /**
  * The mpp-session provider, hosted inside a single Durable Object.
@@ -154,18 +139,9 @@ export class ChannelSession extends DurableObject<Env> {
     // Payment credential (MPP_SESSION_WS_VERIFIED); upgrade requests are
     // answered with 101 here, everything else falls through to the data route.
     const fetchOrderbook = async () => {
-      const params = new URLSearchParams({
-        selling_asset_type: 'native',
-        buying_asset_type: 'credit_alphanum4',
-        buying_asset_code: 'USDC',
-        buying_asset_issuer: USDC_ISSUERS[network],
-        limit: '5',
-      })
-      const response = await fetch(`${HORIZON_URLS[network]}/order_book?${params.toString()}`, {
-        headers: { accept: 'application/json' },
-      })
-      if (!response.ok) throw new Error(`Horizon responded ${response.status}`)
-      const orderbook = (await response.json()) as OrderBookResponse
+      // Shared with provider-a via @routedock/routedock/network (issue #578):
+      // one definition of the issuer table and Horizon URL.
+      const orderbook = await fetchXlmUsdcOrderBook(network, 5)
       return {
         pair: 'XLM/USDC',
         timestamp: new Date().toISOString(),

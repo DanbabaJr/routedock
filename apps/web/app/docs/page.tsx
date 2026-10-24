@@ -219,7 +219,7 @@ fastify.get('/price', async () => ({ price: '0.199', pair: 'XLM/USDC' }))`}</Cod
               </p>
               <Code>{JSON.stringify(DOCS_MANIFEST_EXAMPLE, null, 2)}</Code>
               <p>
-                The canonical JSON Schema is exported from <InlineCode>@routedock/routedock/schema</InlineCode> (source file at <InlineCode>packages/sdk/src/schemas/routedock.schema.json</InlineCode>). Providers can validate manifests in automated test suites (see <InlineCode>apps/provider-a/src/__tests__/manifest.test.ts</InlineCode> for the canonical test pattern with Ajv). Modes retained solely for backwards compatibility can be flagged in <InlineCode>deprecated_modes</InlineCode>.
+                The canonical JSON Schema is exported from <InlineCode>@routedock/routedock/schema</InlineCode> (source file at <InlineCode>packages/sdk/src/schemas/routedock.schema.json</InlineCode>). The provider adapters (<InlineCode>routedockHono</InlineCode>, <InlineCode>routedock</InlineCode>, <InlineCode>routedockFastify</InlineCode>) validate <InlineCode>opts.manifest</InlineCode> against it when they are constructed, and throw <InlineCode>RouteDockManifestError</InlineCode> if the modes, prices, asset, network or payee in your options differ from the manifest. Providers can also validate manifests in automated test suites (see <InlineCode>apps/provider-a/src/__tests__/manifest.test.ts</InlineCode> for the canonical test pattern with Ajv). Modes retained solely for backwards compatibility can be flagged in <InlineCode>deprecated_modes</InlineCode>.
               </p>
             </Section>
 

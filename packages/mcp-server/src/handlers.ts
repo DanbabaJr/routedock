@@ -13,6 +13,9 @@
 
 import type { RouteDockClient, SessionHandle, PaymentMode } from '@routedock/routedock'
 import { usdcToStroops } from '@routedock/routedock'
+// Canonical Horizon endpoints (issue #578): the server keeps one copy of the
+// URL table instead of a third one next to the providers and the SDK.
+import { HORIZON_URLS } from '@routedock/routedock/network'
 import { Keypair, Horizon } from '@stellar/stellar-sdk'
 import { MAX_STREAM_MESSAGES } from './tools.js'
 
@@ -460,11 +463,6 @@ export interface CheckBalanceArgs {
   asset_code?: string
   asset_issuer?: string
 }
-
-const HORIZON_URLS = {
-  mainnet: 'https://horizon.stellar.org',
-  testnet: 'https://horizon-testnet.stellar.org',
-} as const
 
 /**
  * Normalized Horizon balance line, flattened across Horizon's discriminated

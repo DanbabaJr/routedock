@@ -11,6 +11,7 @@ export default defineConfig({
     'provider/fastify': 'src/provider/fastify.ts',
     schema: 'src/schema.ts',
     node: 'src/node.ts',
+    network: 'src/network.ts',
   },
   format: ['cjs', 'esm'],
   dts: true,

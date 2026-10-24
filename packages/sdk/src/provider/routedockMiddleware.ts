@@ -1,3 +1,4 @@
+import { assertProviderConfig } from './internal/assertProviderConfig.js'
 import type { Request, Response, NextFunction, RequestHandler } from 'express'
 import { createX402Handler } from './x402Handler.js'
 import { createMppChargeHandler } from './MppChargeHandler.js'
@@ -92,6 +93,7 @@ const MPP_MODES: readonly PaymentMode[] = ['mpp-session', 'mpp-charge']
 
 export function routedock(opts: RouteDockMiddlewareOptions): RequestHandler {
   const startTime = Date.now()
+  assertProviderConfig(opts, 'routedock')
   const signedManifest = signManifest(opts.manifest, opts.payeeSecretKey)
 
   // Register each handler under its payment mode so routing is explicit and

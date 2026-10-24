@@ -3,7 +3,17 @@ import { describe, it } from 'node:test'
 import Ajv from 'ajv'
 import addFormats from 'ajv-formats'
 import schema from '@routedock/routedock/schema'
-import { buildManifest, TESTNET_USDC_CONTRACT } from '../manifest.js'
+import {
+  HORIZON_URLS as SHARED_HORIZON_URLS,
+  TESTNET_USDC_CONTRACT as SHARED_TESTNET_USDC_CONTRACT,
+  USDC_ISSUERS as SHARED_USDC_ISSUERS,
+} from '@routedock/routedock/network'
+import {
+  buildManifest,
+  HORIZON_URLS,
+  TESTNET_USDC_CONTRACT,
+  USDC_ISSUERS,
+} from '../manifest.js'
 
 /**
  * The Express server validated its manifest against the schema at startup and
@@ -44,6 +54,14 @@ describe('provider-a manifest', () => {
 
     // #then
     assert.equal(valid, true, JSON.stringify(validate.errors, null, 2))
+  })
+
+  it('uses the shared network constants from the SDK (issue #578)', () => {
+    // #then — identity, not equality: the re-exports are the same bindings the
+    // SDK defines, so a mainnet constant change cannot land in one copy only.
+    assert.equal(TESTNET_USDC_CONTRACT, SHARED_TESTNET_USDC_CONTRACT)
+    assert.equal(USDC_ISSUERS, SHARED_USDC_ISSUERS)
+    assert.equal(HORIZON_URLS, SHARED_HORIZON_URLS)
   })
 
   it('points the x402 facilitator at the testnet path only on testnet', () => {

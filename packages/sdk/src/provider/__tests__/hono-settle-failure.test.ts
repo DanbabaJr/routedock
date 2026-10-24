@@ -132,6 +132,7 @@ function makeHarness(overrides: Partial<RouteDockHonoOptions> = {}): Harness {
       onSettled: async (txHash: string, amount: string, mode: string, payer: string | null) => {
         settled.push([txHash, amount, mode, String(payer)])
       },
+      manifest: { ...manifest, network: overrides.network ?? 'testnet' },
       ...overrides,
     }),
   )

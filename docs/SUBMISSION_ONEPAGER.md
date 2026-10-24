@@ -16,7 +16,7 @@ Three components ship together:
 
 1. **`@routedock/routedock`** — client and provider libraries. The client handles mode selection and payment execution. The provider middleware handles verification and settlement for all three modes via one Express middleware.
 
-2. **`routedock.json`** — a discovery manifest served at `/.well-known/routedock.json` on every provider. Declares supported modes, pricing, asset, network, and endpoints. Validated against a JSON Schema at startup. Indexed with trigram search in Supabase so agents can query by capability ("find me a streaming price feed") without exact keyword matching.
+2. **`routedock.json`** — a discovery manifest served at `/.well-known/routedock.json` on every provider. Declares supported modes, pricing, asset, network, and endpoints. Each provider adapter validates it against the JSON Schema at startup and refuses to start if the modes, prices, asset, network or payee it charges differ from the manifest. Indexed with trigram search in Supabase so agents can query by capability ("find me a streaming price feed") without exact keyword matching.
 
 3. **Agent vault contract** — a Soroban contract account (`Crossmint/stellar-smart-account` pattern) with three `__check_auth` policies: daily USDC spend cap, endpoint allowlist, and session key expiry. These are consensus-layer guarantees — the chain rejects overspend before any transaction is broadcast.
 

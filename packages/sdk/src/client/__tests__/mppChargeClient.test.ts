@@ -8,6 +8,7 @@
 import { mock, describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { Keypair } from '@stellar/stellar-sdk'
+import { Receipt } from 'mppx'
 import type { RouteDockManifest } from '../../types.js'
 import {
   RouteDockManifestError,
@@ -38,10 +39,8 @@ interface MppxScript {
   fetchNonJson?: boolean
   /** Custom error thrown by mppx.fetch */
   fetchError?: Error
-  /** If set, onProgress fires with this hash (simulating settlement) */
-  paidHash?: string
-  /** If true, onProgress fires with a paid event */
-  firePaid?: boolean
+  /** Payment-Receipt header value set on successful responses */
+  receiptHeader?: string
   /** If set, fake mppx.fetch calls onChallenge with this request first */
   challenge?: ChallengeRequest
   /** HTTP status returned by mppx.rawFetch (retried paid requests) */
@@ -50,7 +49,6 @@ interface MppxScript {
 
 let mppxScript: MppxScript = {}
 
-let capturedOnProgress: ((event: { type: string; hash?: string }) => void) | undefined
 let capturedOnChallenge:
   | ((
       challenge: { request: Record<string, unknown> },
@@ -64,17 +62,20 @@ const rawFetchAuthHeaders: Array<string | undefined> = []
 
 function resetFakeState(): void {
   mppxScript = {}
-  capturedOnProgress = undefined
   capturedOnChallenge = undefined
   createCalls = 0
   createCredentialCalls = 0
   rawFetchAuthHeaders.length = 0
 }
 
-function response(body: unknown, status: number): Response {
+function response(
+  body: unknown,
+  status: number,
+  headers: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
   })
 }
 
@@ -119,7 +120,12 @@ const fakeMppx = {
       })
     }
     const status = mppxScript.fetchStatus ?? 200
-    return status === 200 ? response({ ok: true }, 200) : response(mppxScript.rejectBody ?? { error: 'fail' }, status)
+    if (status !== 200) return response(mppxScript.rejectBody ?? { error: 'fail' }, status)
+    return response(
+      { ok: true },
+      200,
+      mppxScript.receiptHeader ? { 'Payment-Receipt': mppxScript.receiptHeader } : {},
+    )
   },
   rawFetch: async (_url: string, init?: RequestInit): Promise<Response> => {
     const headers = new Headers(init?.headers)
@@ -132,16 +138,8 @@ const fakeMppx = {
 mock.module('mppx/client', {
   namedExports: {
     Mppx: {
-      create: (opts: {
-        methods: Array<{ name: string; onProgress?: (e: unknown) => void }>
-        onChallenge?: typeof capturedOnChallenge
-      }) => {
+      create: (opts: { methods: unknown[]; onChallenge?: typeof capturedOnChallenge }) => {
         createCalls++
-        for (const m of opts.methods) {
-          if (m.onProgress) {
-            capturedOnProgress = m.onProgress as (e: { type: string; hash?: string }) => void
-          }
-        }
         if (opts.onChallenge) capturedOnChallenge = opts.onChallenge
         return fakeMppx
       },
@@ -152,10 +150,9 @@ mock.module('mppx/client', {
 mock.module('@stellar/mpp/charge/client', {
   namedExports: {
     stellar: {
-      charge: (opts: { onProgress?: (e: { type: string; hash?: string }) => void }) => ({
+      charge: () => ({
         name: 'stellar/charge',
         intent: 'charge',
-        onProgress: opts.onProgress,
       }),
     },
   },
@@ -166,7 +163,19 @@ const { MppChargeClient } = await import('../MppChargeClient.js')
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const ASSET_CONTRACT = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
+const TX_HASH_ABC123 = 'TX_HASH_ABC123'
 const PAYEE = Keypair.random()
+
+function receiptHeader(reference: string): string {
+  return Receipt.serialize(
+    Receipt.from({
+      method: 'stellar',
+      reference,
+      status: 'success',
+      timestamp: new Date().toISOString(),
+    }),
+  )
+}
 
 function buildManifest(): RouteDockManifest {
   return {
@@ -208,29 +217,31 @@ describe('MppChargeClient — success path', () => {
     assert.equal(result.mode, 'mpp-charge')
     assert.equal(result.amount, '0.0008')
     assert.deepEqual(result.data, { ok: true })
-    assert.equal(result.txHash, null, 'no paid event means txHash stays null')
     assert.equal(typeof result.timestamp, 'number')
   })
 
-  it('captures txHash when onProgress fires with a paid event', async () => {
-    mppxScript = { fetchStatus: 200, firePaid: true }
+  it('reads txHash from a valid Payment-Receipt header', async () => {
+    mppxScript = { fetchStatus: 200, receiptHeader: receiptHeader(TX_HASH_ABC123) }
     const client = new MppChargeClient(Keypair.random(), 'testnet')
+    const result = await client.pay('https://provider.test/price', buildManifest())
+    assert.equal(result.txHash, TX_HASH_ABC123)
+    assert.deepEqual(result.data, { ok: true })
+  })
 
-    // Fire the paid event before pay() is called — capturedOnProgress is set
-    // when Mppx.create() runs inside pay(), so we use a microtask to fire it
-    // after the client sets it up.
-    const originalFetch = fakeMppx.fetch
-    fakeMppx.fetch = async (url: string, init?: RequestInit) => {
-      capturedOnProgress?.({ type: 'paid', hash: 'TX_HASH_ABC123' })
-      const resp = await originalFetch(url, init)
-      return resp
-    }
-    try {
-      const result = await client.pay('https://provider.test/price', buildManifest())
-      assert.equal(result.txHash, 'TX_HASH_ABC123')
-    } finally {
-      fakeMppx.fetch = originalFetch
-    }
+  it('returns null txHash without failing when the receipt header is missing', async () => {
+    mppxScript = { fetchStatus: 200 }
+    const client = new MppChargeClient(Keypair.random(), 'testnet')
+    const result = await client.pay('https://provider.test/price', buildManifest())
+    assert.equal(result.txHash, null)
+    assert.deepEqual(result.data, { ok: true })
+  })
+
+  it('returns null txHash without failing when the receipt header is malformed', async () => {
+    mppxScript = { fetchStatus: 200, receiptHeader: 'not-valid-base64url' }
+    const client = new MppChargeClient(Keypair.random(), 'testnet')
+    const result = await client.pay('https://provider.test/price', buildManifest())
+    assert.equal(result.txHash, null)
+    assert.deepEqual(result.data, { ok: true })
   })
 })
 

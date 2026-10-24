@@ -14,11 +14,14 @@ import {
 import { withRetry, type RetryPolicy } from '../internal/retry.js'
 import { usdcToStroops } from '../internal/usdc.js'
 import { noopLogger, type RouteDockLogger } from '../internal/logger.js'
-import schema from '../schemas/routedock.schema.json' assert { type: 'json' }
 import pkg from '../../package.json' assert { type: 'json' }
 import { verifyManifestSignature } from '../manifest/sign.js'
+import { assertManifestValid, validateManifestSchema } from '../manifest/validate.js'
 
-const validator = new Validator(schema as unknown as Schema, '7')
+// The schema validator and semantic checks live in manifest/validate.ts so the
+// provider adapters validate with exactly the same rules. Re-exported because
+// the package entry points publish it through `export *`.
+export { assertManifestValid }
 
 const SDK_VERSION = pkg.version as string
 
@@ -134,118 +137,6 @@ export function assertEndpointActive(
   }
 }
 
-/**
- * Validate semantic constraints for manifest fields beyond JSON schema syntax.
- * Enforces:
- * - All keys in `latency_hints` must be a subset of declared `regions`.
- * - If `assets` is defined, it must be a non-empty array whose first entry
- *   (`assets[0]`) matches the root-level `asset` and `asset_contract`.
- * - Every mode in `modes` has a matching `pricing` entry, so `pay()` and
- *   `estimateCost()` never read a missing price.
- * - Every entry in `deprecated_modes` is also listed in `modes`.
- * - Every price (`amount`, `rate`, `min_deposit`) is a decimal the SDK can
- *   convert to base units (non-negative, at most 7 fractional digits).
- *
- * Every failure is a {@link RouteDockManifestError}.
- */
-export function assertManifestValid(manifest: RouteDockManifest, baseUrl?: string): void {
-  const context = baseUrl ? ` at ${baseUrl}` : ''
-  if (manifest.latency_hints !== undefined) {
-    if (!Array.isArray(manifest.regions) || manifest.regions.length === 0) {
-      throw new RouteDockManifestError(
-        `Invalid manifest${context}: latency_hints defined without declaring regions`,
-      )
-    }
-    const regionSet = new Set(manifest.regions)
-    for (const region of Object.keys(manifest.latency_hints)) {
-      if (!regionSet.has(region)) {
-        throw new RouteDockManifestError(
-          `Invalid manifest${context}: latency_hints key '${region}' is not declared in regions (${manifest.regions.join(', ')})`,
-        )
-      }
-    }
-  }
-
-  if (manifest.assets !== undefined) {
-    if (!Array.isArray(manifest.assets) || manifest.assets.length === 0) {
-      throw new RouteDockManifestError(
-        `Invalid manifest${context}: assets must be a non-empty array when defined`,
-      )
-    }
-    for (let i = 0; i < manifest.assets.length; i++) {
-      const a = manifest.assets[i]
-      if (!a || typeof a.asset !== 'string' || typeof a.asset_contract !== 'string') {
-        throw new RouteDockManifestError(
-          `Invalid manifest${context}: assets[${i}] must define asset and asset_contract strings`,
-        )
-      }
-    }
-    const first = manifest.assets[0]!
-    if (first.asset !== manifest.asset || first.asset_contract !== manifest.asset_contract) {
-      throw new RouteDockManifestError(
-        `Invalid manifest${context}: assets[0] (${first.asset}:${first.asset_contract}) must match root asset fields (${manifest.asset}:${manifest.asset_contract})`,
-      )
-    }
-  }
-
-  assertPricingMatchesModes(manifest, context)
-  assertDeprecatedModesListed(manifest, context)
-  assertPricesParse(manifest, context)
-}
-
-function assertPricingMatchesModes(manifest: RouteDockManifest, context: string): void {
-  const pricing = (manifest.pricing ?? {}) as Record<string, unknown>
-  for (const mode of manifest.modes ?? []) {
-    if (pricing[mode] === undefined || pricing[mode] === null) {
-      throw new RouteDockManifestError(
-        `Invalid manifest${context}: mode '${mode}' is listed in modes but pricing.${mode} is missing`,
-      )
-    }
-  }
-}
-
-function assertDeprecatedModesListed(manifest: RouteDockManifest, context: string): void {
-  if (manifest.deprecated_modes === undefined) return
-  const modes = new Set<string>(manifest.modes ?? [])
-  for (const mode of manifest.deprecated_modes) {
-    if (!modes.has(mode)) {
-      throw new RouteDockManifestError(
-        `Invalid manifest${context}: deprecated_modes entry '${mode}' is not listed in modes`,
-      )
-    }
-  }
-}
-
-const PRICE_FIELDS: Record<string, readonly string[]> = {
-  x402: ['amount'],
-  'mpp-charge': ['amount'],
-  'mpp-session': ['rate', 'min_deposit'],
-  'mpp-session-ws': ['rate', 'min_deposit'],
-}
-
-function assertPricesParse(manifest: RouteDockManifest, context: string): void {
-  const pricing = (manifest.pricing ?? {}) as Record<string, Record<string, unknown> | undefined>
-  for (const [mode, fields] of Object.entries(PRICE_FIELDS)) {
-    const entry = pricing[mode]
-    if (entry === undefined || entry === null) continue
-    for (const field of fields) {
-      const value = entry[field]
-      try {
-        if (typeof value !== 'string') {
-          throw new RangeError(`expected a decimal string, got ${typeof value}`)
-        }
-        usdcToStroops(value)
-      } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err)
-        throw new RouteDockManifestError(
-          `Invalid manifest${context}: pricing.${mode}.${field} ${JSON.stringify(value)} is not a valid amount (${detail})`,
-          { cause: err },
-        )
-      }
-    }
-  }
-}
-
 interface CacheEntry {
   manifest: RouteDockManifest
   fetchedAt: number
@@ -301,6 +192,15 @@ class LruCache<K, V> {
 
 /** In-memory manifest cache keyed by base URL, bounded to avoid unbounded heap growth. */
 const manifestCache = new LruCache<string, CacheEntry>(DEFAULT_MANIFEST_CACHE_MAX_SIZE)
+
+/**
+ * In-flight manifest fetches keyed by base URL. Concurrent cache misses for
+ * the same origin share one HTTP request, one signature verification pass and
+ * one schema validation instead of fanning out. Entries are removed as soon
+ * as the shared fetch settles — success caches via `manifestCache`, failure
+ * leaves nothing behind so the next call retries.
+ */
+const inflightManifestFetches = new Map<string, Promise<RouteDockManifest>>()
 
 /**
  * Override the manifest cache's max size (default 512). Affects the shared,
@@ -414,6 +314,12 @@ export interface ModeSelectOptions {
  * Callers that obtained a payee from a registry/pinned allowlist MUST pass it;
  * without it the self-signed signature alone proves nothing about who served
  * the manifest.
+ *
+ * Concurrent calls that miss the cache for the same `baseUrl` share one
+ * in-flight HTTP request instead of fanning out (the cache is process-wide,
+ * so this also holds across `RouteDockClient` instances). The first caller's
+ * `retryPolicy` and `manifestTimeoutMs` govern the shared request; the
+ * per-caller checks above still run for every caller after it settles.
  */
 export async function fetchManifest(
   baseUrl: string,
@@ -434,6 +340,44 @@ export async function fetchManifest(
     return cached.manifest
   }
 
+  // Deduplicate concurrent misses: the first caller starts the fetch, the
+  // rest join the shared promise. The shared fetch runs only caller-
+  // independent work (HTTP, JSON parse, schema validation, caching); the
+  // per-caller checks run below after every caller awaits it, so a caller
+  // with a different trust anchor is still enforced. A rejected shared fetch
+  // rejects every waiter and is never cached — the next call retries with
+  // its own retry policy and timeout.
+  let inflight = inflightManifestFetches.get(baseUrl)
+  if (!inflight) {
+    inflight = fetchAndCacheManifest(baseUrl, retryPolicy, manifestTimeoutMs).finally(() => {
+      inflightManifestFetches.delete(baseUrl)
+    })
+    inflightManifestFetches.set(baseUrl, inflight)
+  }
+
+  const manifest = await inflight
+
+  // Same per-caller checks as the cache-hit path, so joining an in-flight
+  // fetch weakens nothing.
+  verifyManifestSignature(manifest, expectedPayee)
+  assertClientVersionSupported(manifest, baseUrl)
+  assertManifestVersionSupported(manifest, baseUrl)
+  assertManifestValid(manifest, baseUrl)
+  assertManifestActive(manifest, baseUrl)
+  return manifest
+}
+
+/**
+ * Fetch, validate and cache a manifest with no cache lookup and no
+ * deduplication. Callers go through `fetchManifest`, which owns both.
+ * The first caller's `retryPolicy` and `manifestTimeoutMs` govern the shared
+ * request when this is fanned in from concurrent callers.
+ */
+async function fetchAndCacheManifest(
+  baseUrl: string,
+  retryPolicy?: RetryPolicy,
+  manifestTimeoutMs = DEFAULT_MANIFEST_TIMEOUT_MS,
+): Promise<RouteDockManifest> {
   const url = baseUrl.replace(/\/$/, '') + '/.well-known/routedock.json'
 
   return withRetry(async () => {
@@ -474,15 +418,16 @@ export async function fetchManifest(
       throw new RouteDockManifestError(`Manifest at ${url} is not valid JSON`, { cause: err })
     }
 
-    const result = validator.validate(raw)
-    if (!result.valid) {
-      const msgs = result.errors.map(err => err.error).join('; ')
-      throw new RouteDockManifestError(`Invalid manifest at ${url}: ${msgs}`)
-    }
+    validateManifestSchema(raw, url)
 
     const manifest = raw as unknown as RouteDockManifest
+    // Caller-independent gates run before caching so a manifest nobody could
+    // use (malformed, wrong schema version, past sunset, bad self-signature)
+    // is never cached. The per-caller trust-anchor binding is deliberately
+    // not checked here — expectedPayee differs per caller — and runs in
+    // fetchManifest after the shared promise settles.
     assertManifestValid(manifest, baseUrl)
-    verifyManifestSignature(manifest, expectedPayee)
+    verifyManifestSignature(manifest)
     assertClientVersionSupported(manifest, baseUrl)
     assertManifestVersionSupported(manifest, baseUrl)
     assertManifestActive(manifest, baseUrl)

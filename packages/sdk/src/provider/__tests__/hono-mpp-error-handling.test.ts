@@ -11,8 +11,8 @@ import { mock, describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { Hono } from 'hono'
 import { Keypair } from '@stellar/stellar-sdk'
-import type { RouteDockManifest } from '../../types.js'
 import type { RouteDockLogger, RouteDockLogFields } from '../../internal/logger.js'
+import { manifestForOptions } from './helpers/manifestFixture.js'
 
 const payeeKeypair = Keypair.random()
 const commitKeypair = Keypair.random()
@@ -89,29 +89,6 @@ mock.module('../mppCompatibility.js', {
 
 const { routedockHono } = await import('../hono.js')
 
-const manifest: RouteDockManifest = {
-  routedock: '1.0',
-  name: 'Mpp Error Handling Test',
-  description: 'Unit test provider',
-  modes: ['mpp-charge', 'mpp-session'],
-  network: 'testnet',
-  asset: 'USDC',
-  asset_contract: ASSET_CONTRACT,
-  payee: payeeKeypair.publicKey(),
-  pricing: {
-    'mpp-charge': { amount: '0.001', per: 'request' },
-    'mpp-session': {
-      rate: '0.0001',
-      per: 'voucher',
-      channel_factory: CHANNEL_CONTRACT,
-      min_deposit: '0.10',
-      refund_waiting_period_ledgers: 17280,
-    },
-  },
-  endpoints: { price: { method: 'GET', path: '/price' } },
-  tags: ['test'],
-}
-
 const BASE_OPTS = {
   asset: 'USDC',
   assetContract: ASSET_CONTRACT,
@@ -119,7 +96,6 @@ const BASE_OPTS = {
   network: 'testnet' as const,
   payeeSecretKey: payeeKeypair.secret(),
   commitmentPublicKey: commitKeypair.publicKey(),
-  manifest,
 }
 
 let logCalls: Array<{ level: string; message: string; fields?: RouteDockLogFields | undefined }> = []
@@ -128,16 +104,19 @@ const logger: RouteDockLogger = (level, message, fields) => {
 }
 
 function makeApp(mode: 'mpp-charge' | 'mpp-session'): Hono {
+  const pricing =
+    mode === 'mpp-charge'
+      ? { 'mpp-charge': '0.001' }
+      : { 'mpp-session': { rate: '0.0001', channelFactory: CHANNEL_CONTRACT } }
   const app = new Hono()
   app.use(
     '*',
     routedockHono({
       ...BASE_OPTS,
       modes: [mode],
-      pricing:
-        mode === 'mpp-charge'
-          ? { 'mpp-charge': '0.001' }
-          : { 'mpp-session': { rate: '0.0001', channelFactory: CHANNEL_CONTRACT } },
+      pricing,
+      // The adapter refuses to start unless the manifest agrees with its options.
+      manifest: manifestForOptions({ ...BASE_OPTS, modes: [mode], pricing, name: 'Mpp Error Handling Test' }),
       logger,
     }),
   )

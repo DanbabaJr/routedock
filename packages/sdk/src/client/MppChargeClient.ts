@@ -1,6 +1,7 @@
 import { Keypair } from '@stellar/stellar-sdk'
 import { stellar } from '@stellar/mpp/charge/client'
 import { Mppx } from 'mppx/client'
+import { Receipt } from 'mppx'
 import type { RouteDockManifest, PaymentResult, PaymentRequest } from '../types.js'
 import {
   RouteDockManifestError,
@@ -38,7 +39,6 @@ export class MppChargeClient {
     // mppx and any RouteDock-level retry all send the same body.
     const prepared = await prepareRequest(request)
 
-    let txHash: string | null = null
     let signedAmount: string | undefined
     // The credential is created at most once per pay() call. Every retry after
     // the first reuses it, so the provider's idempotency store can replay the
@@ -51,11 +51,6 @@ export class MppChargeClient {
         stellar.charge({
           keypair: this.keypair,
           mode: 'pull',
-          onProgress(event) {
-            if (event.type === 'paid') {
-              txHash = event.hash
-            }
-          },
         }),
       ],
       onChallenge: async (challenge, { createCredential }) => {
@@ -98,6 +93,8 @@ export class MppChargeClient {
         throw await paymentRejectedError('MPP charge failed', response.status, response)
       }
 
+      const txHash = readSettlementHash(response)
+
       let data: unknown
       try {
         data = await response.json()
@@ -115,5 +112,13 @@ export class MppChargeClient {
         timestamp: Date.now(),
       }
     }, this.retryPolicy)
+  }
+}
+
+function readSettlementHash(response: Response): string | null {
+  try {
+    return Receipt.fromResponse(response).reference
+  } catch {
+    return null
   }
 }

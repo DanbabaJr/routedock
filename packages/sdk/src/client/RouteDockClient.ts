@@ -8,6 +8,7 @@ import type { PaymentResult, SessionHandle, SessionOptions, RouteDockManifest, P
 import { RouteDockManifestError, RouteDockPolicyRejectError, RouteDockTrustlineError } from '../errors.js'
 import type { RetryPolicy } from '../internal/retry.js'
 import { USDC_ISSUERS, usdcToStroops } from '../internal/usdc.js'
+import { HORIZON_URLS } from '../network.js'
 import { InMemorySpendStore, type DailySpend, type SpendStore } from '../store/SpendStore.js'
 import { selectAsset } from '../internal/assetUtils.js'
 
@@ -246,7 +247,7 @@ export class RouteDockClient {
     // Carry the client's logger into retry diagnostics so a consumer that
     // silences the SDK silences the retry path too.
     const retryPolicy = this.logger ? { ...this.retryPolicy, logger: this.logger } : this.retryPolicy
-    this.x402 = new X402Client(secretKey, this.network, retryPolicy, config.preSignHook)
+    this.x402 = new X402Client(secretKey, this.network, retryPolicy, config.preSignHook, this.logger)
     this.charge = new MppChargeClient(this.keypair, this.network, retryPolicy)
     this.session = new MppSessionClient(this.keypair, this.network, retryPolicy, undefined, this.logger)
   }
@@ -376,12 +377,7 @@ export class RouteDockClient {
     const cached = RouteDockClient._trustlineCache.get(cacheKey)
     if (cached && Date.now() < cached.expiresAt) return
 
-    const horizonUrl =
-      this.network === 'testnet'
-        ? 'https://horizon-testnet.stellar.org'
-        : 'https://horizon.stellar.org'
-
-    const server = new Horizon.Server(horizonUrl)
+    const server = new Horizon.Server(HORIZON_URLS[this.network])
     try {
       const account = await server.loadAccount(this.keypair.publicKey())
       const balances = account.balances as unknown[]
@@ -675,19 +671,22 @@ export class RouteDockClient {
     if (!this.spendCap) return ''
     this._assertCapAsset(asset)
 
-    return this._withSpendMutex(async () => {
+    const spendCap = this.spendCap
+    const amountMicros = usdcToStroops(amount)
+
+    // Pure function of the previous state: a store that retries (optimistic
+    // concurrency) may call it more than once, so it must have no side effects.
+    const reserve = (prev: DailySpend | null): DailySpend => {
       const today = new Date().toISOString().slice(0, 10)
-      const persisted = await this.spendStore.read()
       const current: DailySpend =
-        persisted && persisted.date === today
-          ? persisted
+        prev && prev.date === today
+          ? { ...prev, endpoints: { ...prev.endpoints } }
           : { date: today, totalMicros: '0', endpoints: {} }
 
-      const amountMicros = usdcToStroops(amount)
       const total = BigInt(current.totalMicros)
 
       // 1. Per-endpoint cap check
-      const endpointCapStr = this.spendCap!.endpointCaps?.[endpointKey]
+      const endpointCapStr = spendCap.endpointCaps?.[endpointKey]
       if (endpointCapStr !== undefined) {
         const endpointCapMicros = usdcToStroops(endpointCapStr)
         const endpointTotal = BigInt(current.endpoints[endpointKey] ?? '0')
@@ -697,20 +696,32 @@ export class RouteDockClient {
       }
 
       // 2. Global daily cap check
-      const globalCapMicros = usdcToStroops(this.spendCap!.daily)
+      const globalCapMicros = usdcToStroops(spendCap.daily)
       if (total + amountMicros > globalCapMicros) {
         throw new RouteDockPolicyRejectError('local_daily_cap_exceeded')
       }
 
       // Both checks passed — reserve the spend (tentatively record)
-      const reserveId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-      this._pendingReserves.set(reserveId, { endpointKey, amountMicros })
       current.totalMicros = (total + amountMicros).toString()
       if (endpointCapStr !== undefined) {
         current.endpoints[endpointKey] =
           (BigInt(current.endpoints[endpointKey] ?? '0') + amountMicros).toString()
       }
-      await this.spendStore.write(current)
+      return current
+    }
+
+    return this._withSpendMutex(async () => {
+      const store = this.spendStore
+      if (store.update) {
+        // Atomic across processes: read, check and write happen under the
+        // store's own lock, so two clients sharing one store cannot both pass
+        // the check against the same total.
+        await store.update(reserve)
+      } else {
+        await store.write(reserve(await store.read()))
+      }
+      const reserveId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      this._pendingReserves.set(reserveId, { endpointKey, amountMicros })
       return reserveId
     })
   }
@@ -737,25 +748,34 @@ export class RouteDockClient {
 
     const { endpointKey, amountMicros } = reserve
 
-    await this._withSpendMutex(async () => {
+    // Pure function of the previous state (see _checkAndReserveSpend).
+    // Returns undefined when there is nothing to roll back (e.g. day rollover).
+    const release = (prev: DailySpend | null): DailySpend | undefined => {
       const today = new Date().toISOString().slice(0, 10)
-      const persisted = await this.spendStore.read()
-      if (!persisted || persisted.date !== today) return
+      if (!prev || prev.date !== today) return undefined
 
-      const currentTotal = BigInt(persisted.totalMicros)
-      persisted.totalMicros = (currentTotal - amountMicros).toString()
+      const persisted: DailySpend = { ...prev, endpoints: { ...prev.endpoints } }
+      persisted.totalMicros = (BigInt(persisted.totalMicros) - amountMicros).toString()
 
       if (persisted.endpoints[endpointKey]) {
-        const endpointTotal = BigInt(persisted.endpoints[endpointKey])
-        const newEndpointTotal = endpointTotal - amountMicros
+        const newEndpointTotal = BigInt(persisted.endpoints[endpointKey]) - amountMicros
         if (newEndpointTotal <= 0n) {
           delete persisted.endpoints[endpointKey]
         } else {
           persisted.endpoints[endpointKey] = newEndpointTotal.toString()
         }
       }
+      return persisted
+    }
 
-      await this.spendStore.write(persisted)
+    await this._withSpendMutex(async () => {
+      const store = this.spendStore
+      if (store.update) {
+        await store.update(release)
+      } else {
+        const next = release(await store.read())
+        if (next) await store.write(next)
+      }
     })
   }
 }

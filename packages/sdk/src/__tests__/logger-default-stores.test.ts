@@ -11,6 +11,7 @@ import assert from 'node:assert/strict'
 import { describe, it, beforeEach } from 'node:test'
 import { Keypair } from '@stellar/stellar-sdk'
 import { routedockHono } from '../provider/hono.js'
+import { manifestForOptions } from '../provider/__tests__/helpers/manifestFixture.js'
 import { routedock } from '../provider/routedockMiddleware.js'
 import { RouteDockClient } from '../client/RouteDockClient.js'
 import type { RouteDockLogLevel, RouteDockLogger } from '../internal/logger.js'
@@ -85,28 +86,28 @@ beforeEach(() => {
 describe('supplied logger reaches the default stores (#286)', () => {
   it('reaches the Hono x402 SeenTxStore', () => {
     onWorkers(() => {
-      routedockHono({ ...BASE_OPTS, modes: ['x402'], pricing: { x402: '0.001' } })
+      routedockHono({ ...BASE_OPTS, modes: ['x402'], pricing: { x402: '0.001' }, manifest: manifestForOptions({ payee: payeeKeypair.publicKey(), modes: ['x402'], pricing: { x402: '0.001' }, assetContract: ASSET_CONTRACT }) })
     })
     assert.ok(warnedWith(SEEN_TX_WARNING), 'Hono x402 warned through console, not the logger')
   })
 
   it('reaches the Hono mpp-charge SeenTxStore', () => {
     onWorkers(() => {
-      routedockHono({ ...BASE_OPTS, modes: ['mpp-charge'], pricing: { 'mpp-charge': '0.001' } })
+      routedockHono({ ...BASE_OPTS, modes: ['mpp-charge'], pricing: { 'mpp-charge': '0.001' }, manifest: manifestForOptions({ payee: payeeKeypair.publicKey(), modes: ['mpp-charge'], pricing: { 'mpp-charge': '0.001' }, assetContract: ASSET_CONTRACT }) })
     })
     assert.ok(warnedWith(SEEN_TX_WARNING), 'Hono mpp-charge warned through console, not the logger')
   })
 
   it('reaches the Express x402 SeenTxStore', () => {
     onWorkers(() => {
-      routedock({ ...BASE_OPTS, modes: ['x402'], pricing: { x402: '0.001' } })
+      routedock({ ...BASE_OPTS, modes: ['x402'], pricing: { x402: '0.001' }, manifest: manifestForOptions({ payee: payeeKeypair.publicKey(), modes: ['x402'], pricing: { x402: '0.001' }, assetContract: ASSET_CONTRACT }) })
     })
     assert.ok(warnedWith(SEEN_TX_WARNING), 'Express x402 warned through console, not the logger')
   })
 
   it('reaches the Express mpp-charge SeenTxStore', () => {
     onWorkers(() => {
-      routedock({ ...BASE_OPTS, modes: ['mpp-charge'], pricing: { 'mpp-charge': '0.001' } })
+      routedock({ ...BASE_OPTS, modes: ['mpp-charge'], pricing: { 'mpp-charge': '0.001' }, manifest: manifestForOptions({ payee: payeeKeypair.publicKey(), modes: ['mpp-charge'], pricing: { 'mpp-charge': '0.001' }, assetContract: ASSET_CONTRACT }) })
     })
     assert.ok(warnedWith(SEEN_TX_WARNING), 'Express mpp-charge warned through console, not the logger')
   })

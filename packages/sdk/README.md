@@ -122,6 +122,24 @@ const client = new RouteDockClient({
 })
 ```
 
+**Sharing one store between processes.** The client serializes its own
+read → check → write, but that only protects one `RouteDockClient`. If two
+processes can use the same store (the MCP server and the example agent both
+default to `~/.routedock/spend.json`), a plain `read()` / `write()` store can
+lose updates and let the cap be exceeded. A shared store must implement the
+optional atomic `update(fn)` method, which the client uses automatically.
+`FileSpendStore` implements it with an exclusive lock file
+(`<file>.lock`, stale locks from crashed processes are broken after 10 s):
+
+```ts
+const store: SpendStore = {
+  read, write,
+  // fn(prev) returns the next state, or undefined to leave it unchanged.
+  // Make the read, fn and write atomic (a transaction, CAS loop, lock, ...).
+  async update(fn) { /* ... */ },
+}
+```
+
 ## Provider Usage
 
 ```ts

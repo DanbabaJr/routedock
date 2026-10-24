@@ -8,15 +8,14 @@ import {
   InMemorySeenTxStore,
   type SeenTxStore,
 } from '@routedock/routedock/provider/hono'
+import { buildManifest, MPP_CHARGE_PRICE, X402_PRICE } from './manifest.js'
 import {
-  buildManifest,
-  HORIZON_URLS,
-  MPP_CHARGE_PRICE,
-  TESTNET_USDC_CONTRACT,
-  USDC_ISSUERS,
-  X402_PRICE,
+  fetchXlmUsdcOrderBook,
+  findStellarConfigProblems,
+  resolveAssetContract,
+  resolveNetwork,
   type Network,
-} from './manifest.js'
+} from '@routedock/routedock/network'
 
 export interface Env {
   STELLAR_NETWORK?: string
@@ -30,77 +29,15 @@ export interface Env {
   PUBLIC_BASE_URL?: string
 }
 
-interface OrderBookLevel {
-  price: string
-  amount: string
-}
-
-interface OrderBookResponse {
-  asks: OrderBookLevel[]
-  bids: OrderBookLevel[]
-}
-
-function resolveNetwork(raw: string | undefined): Network {
-  return raw === 'mainnet' ? 'mainnet' : 'testnet'
-}
-
-function resolveAssetContract(env: Env, network: Network): string {
-  if (env.USDC_ASSET_CONTRACT) return env.USDC_ASSET_CONTRACT
-  if (network === 'testnet') return TESTNET_USDC_CONTRACT
-  throw new Error('USDC_ASSET_CONTRACT is required for mainnet')
-}
-
-/**
- * Return the names of environment variables that are unset or malformed.
- * Values are never included — only names, so this is safe to log or return
- * to a caller directly. Shared by createApp (throws, caught by fetch() below)
- * and healthResponse (reports 503 without ever building the app).
- */
-function findStartupProblems(env: Env, network: Network): string[] {
-  const problems: string[] = []
-  if (!env.STELLAR_PAYEE_SECRET || !env.STELLAR_PAYEE_SECRET.startsWith('S')) {
-    problems.push('STELLAR_PAYEE_SECRET')
-  }
-  if (!env.STELLAR_PAYEE_ADDRESS) {
-    problems.push('STELLAR_PAYEE_ADDRESS')
-  }
-  if (network === 'mainnet' && !env.USDC_ASSET_CONTRACT) {
-    problems.push('USDC_ASSET_CONTRACT')
-  }
-  return problems
-}
-
-/**
- * Fetch the XLM/USDC orderbook straight from Horizon's REST API.
- *
- * The Express build used `Horizon.Server(...).orderbook(...)`, which pulls the
- * whole `@stellar/stellar-sdk` (and axios) into the bundle for what is a single
- * GET. Calling the endpoint keeps the Worker small and drops the dependency.
- */
-async function fetchOrderBook(network: Network, limit: number): Promise<OrderBookResponse> {
-  const params = new URLSearchParams({
-    selling_asset_type: 'native',
-    buying_asset_type: 'credit_alphanum4',
-    buying_asset_code: 'USDC',
-    buying_asset_issuer: USDC_ISSUERS[network],
-    limit: String(limit),
-  })
-
-  const response = await fetch(`${HORIZON_URLS[network]}/order_book?${params.toString()}`, {
-    headers: { accept: 'application/json' },
-  })
-
-  if (!response.ok) {
-    throw new Error(`Horizon responded ${response.status}`)
-  }
-
-  return (await response.json()) as OrderBookResponse
-}
-
 function createApp(env: Env, ctx: ExecutionContext): Hono {
   const network = resolveNetwork(env.STELLAR_NETWORK)
 
-  const problems = findStartupProblems(env, network)
+  // The shared config check, asset-contract resolution and Horizon orderbook
+  // fetch come from @routedock/routedock/network so provider-a and provider-b
+  // cannot drift (issue #578). createApp throws on problems; the result is
+  // caught by fetch() below, and healthResponse reports the same list as 503
+  // without ever building the app.
+  const problems = findStellarConfigProblems(env, network)
   if (problems.length > 0) {
     throw new Error(`Provider misconfigured: ${problems.join(', ')} unset`)
   }
@@ -170,7 +107,7 @@ function createApp(env: Env, ctx: ExecutionContext): Hono {
 
   app.get('/price', async (c) => {
     try {
-      const orderbook = await fetchOrderBook(network, 1)
+      const orderbook = await fetchXlmUsdcOrderBook(network, 1)
       const ask = orderbook.asks[0]
       const bid = orderbook.bids[0]
 
@@ -206,7 +143,7 @@ function createApp(env: Env, ctx: ExecutionContext): Hono {
 function healthResponse(env: Env): Response {
   const addr = env.STELLAR_PAYEE_ADDRESS
   const network = resolveNetwork(env.STELLAR_NETWORK)
-  const missing = findStartupProblems(env, network)
+  const missing = findStellarConfigProblems(env, network)
   return Response.json(
     {
       status: missing.length > 0 ? 'misconfigured' : 'ok',

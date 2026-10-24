@@ -94,7 +94,7 @@ pnpm dev
 
 `.dev.vars` is gitignored. Never put a secret in `wrangler.jsonc`; it is committed. Real secrets are set with `wrangler secret put` by a maintainer.
 
-Adding a dependency to a provider is the highest-risk change in this repo. The Workers runtime rejects `eval` and `new Function`, which is why `ajv` validates manifests in a **test** rather than at startup. Always confirm your dependency bundles:
+Adding a dependency to a provider is the highest-risk change in this repo. The Workers runtime rejects `eval` and `new Function`, which is why `ajv` stays **test-only**; the adapters validate the manifest at startup with `@cfworker/json-schema`, which avoids both. Always confirm your dependency bundles:
 
 ```bash
 pnpm --filter provider-a build   # fails loudly if the dep is Workers-hostile

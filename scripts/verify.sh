@@ -75,8 +75,9 @@ pnpm --filter provider-b test
 
 step "provider bundles"
 # Catches a dependency that cannot run on Workers — the runtime rejects eval
-# and new Function, which is why ajv validates manifests in a test, not at
-# startup. Needs no Cloudflare credentials.
+# and new Function, which is why ajv stays test-only. The adapters validate
+# the manifest at startup with @cfworker/json-schema instead, which avoids
+# both. Needs no Cloudflare credentials.
 pnpm --filter provider-a build >/dev/null || fail "provider-a does not bundle for Workers"
 pnpm --filter provider-b build >/dev/null || fail "provider-b does not bundle for Workers"
 echo "  ok"
